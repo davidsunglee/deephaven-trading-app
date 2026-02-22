@@ -1,0 +1,8 @@
+# Deephaven embedded server + plugins
+deephaven-server>=0.36.0
+deephaven-plugin-ui>=0.30.0
+deephaven-plugin-plotly-express>=0.15.0
+
+# These are pulled in automatically but listed for clarity
+numpy
+pandas
