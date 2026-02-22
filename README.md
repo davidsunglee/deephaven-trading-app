@@ -1,208 +1,112 @@
-# Real-Time Trading App with Deephaven.io
+# Deephaven Real-Time Trading Platform
 
-A comprehensive real-time trading application built with Python, Deephaven.io, and modern web technologies.
-
-## Features
-
-### 🔄 Real-Time Data
-- **Live Price Updates**: Ticking prices for major stocks (AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, NFLX)
-- **Bid/Ask Spreads**: Real-time market depth simulation
-- **Volume Tracking**: Live trading volume updates
-- **Timestamp Precision**: Millisecond-accurate time stamps
-
-### 📊 Risk Analytics
-- **Portfolio P&L**: Real-time profit and loss calculations
-- **Market Value**: Current portfolio valuation
-- **Options Greeks**: Delta, Gamma, Theta, Vega calculations
-- **Position Tracking**: Real-time position monitoring
-
-### 🎯 User Interface
-- **Grid Display**: Professional AG-Grid components for data visualization
-- **Real-Time Updates**: WebSocket-based live data streaming
-- **Responsive Design**: Works on desktop and mobile devices
-- **Color Coding**: Green for positive, red for negative values
-
-### 🏗️ Technology Stack
-- **Backend**: Python with Deephaven.io
-- **Data Processing**: Pandas, NumPy
-- **Web Framework**: Flask with Socket.IO
-- **Frontend**: HTML5, Tailwind CSS, AG-Grid
-- **Real-Time Communication**: WebSockets
-
-## Quick Start
-
-### 1. Install Dependencies
-```bash
-pip install -r requirements.txt
-```
-
-### 2. Run the Application
-```bash
-python app.py
-```
-
-### 3. Access the Dashboard
-Open your browser and navigate to: `http://localhost:8080`
+A **server/client** real-time trading platform built on [Deephaven.io](https://deephaven.io). The server acts as a shared data engine (run by infra/platform team) while multiple Python clients (quants, risk analysts, PMs) connect remotely to configure their own ticking views.
 
 ## Architecture
 
-### Backend Components
-
-#### `TradingApp` Class
-- **Market Data Simulation**: Generates realistic price movements
-- **Risk Calculations**: Real-time Greek calculations using Black-Scholes
-- **Deephaven Integration**: Manages real-time tables
-- **WebSocket Server**: Emits live updates to clients
-
-#### Data Flow
-1. Market data simulation generates price updates
-2. Risk metrics calculated in real-time
-3. Deephaven tables store and manage data
-4. WebSocket emissions update UI instantly
-
-### Frontend Components
-
-#### Grid Components
-- **Price Grid**: Shows live market data with bid/ask spreads
-- **Risk Grid**: Displays portfolio risk metrics and Greeks
-- **Portfolio Overview**: Key performance indicators
-
-#### Real-Time Features
-- **Auto-updating**: Grids refresh automatically
-- **Visual Feedback**: Flash animations for price changes
-- **Connection Status**: Live connection monitoring
-
-## Configuration
-
-### Customizing Symbols
-Edit the `symbols` list in `app.py`:
-```python
-self.symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'TSLA', 'NVDA', 'META', 'NFLX']
+```
+┌──────────────────────────────────────────────────────┐
+│  SERVER  (server/app.py)        Port 10000           │
+│  • Deephaven embedded server (JVM)                   │
+│  • DynamicTableWriter: prices, risk                  │
+│  • Derived tables: prices_live, risk_live, etc.      │
+│  • Market data simulation thread                     │
+│  • Web IDE at http://localhost:10000                  │
+└───────────────────────┬──────────────────────────────┘
+                        │ gRPC (pydeephaven)
+           ┌────────────┼────────────────┐
+           │            │                │
+     ┌─────▼────┐ ┌────▼─────┐   ┌──────▼─────┐
+     │  Quant   │ │   Risk   │   │     PM     │
+     │  Client  │ │  Client  │   │   Client   │
+     └──────────┘ └──────────┘   └────────────┘
 ```
 
-### Adjusting Update Frequency
-Modify the sleep duration in `simulate_market_data()`:
-```python
-time.sleep(0.1)  # 100ms updates
+## Quick Start
+
+### Prerequisites
+- **Python 3.10+**
+- **Java 11-21** (set `JAVA_HOME`)
+
+### 1. Start the Server
+
+```bash
+pip install -r requirements-server.txt
+cd server
+python3 -i app.py
 ```
 
-### Risk Parameters
-Tune the Black-Scholes parameters in `calculate_greeks()`:
-```python
-sigma = 0.25  # Volatility
-T = time_to_expiry  # Time to expiry
-r = 0.05  # Risk-free rate
+The server starts on **http://localhost:10000** — open this in a browser to access the Deephaven Web IDE with all shared ticking tables.
+
+### 2. Run a Client
+
+In a separate terminal:
+
+```bash
+pip install -r requirements-client.txt
+cd client
+
+# Pick one:
+python3 quant_client.py          # Watchlists, top movers, volume leaders
+python3 risk_client.py           # Large exposures, risk scoring
+python3 pm_client.py             # P&L snapshots, position sizing
 ```
 
-## API Endpoints
+Clients connect via `pydeephaven` (lightweight — **no Java needed** on client machines). Tables created by clients are visible in the Web IDE.
 
-### REST Endpoints
-- `GET /` - Main dashboard
-- `GET /api/prices` - Current price data
-- `GET /api/risk` - Current risk metrics
+## Project Structure
 
-### WebSocket Events
-- `price_update` - Live price data
-- `risk_update` - Live risk metrics
-- `portfolio_update` - Portfolio overview
-
-## Development
-
-### Project Structure
 ```
 windsurf-project/
-├── app.py                 # Main application
-├── requirements.txt       # Dependencies
-├── templates/
-│   └── index.html        # Web dashboard
-└── README.md             # Documentation
+├── server/
+│   ├── app.py              # Deephaven server + data engine
+│   ├── market_data.py      # Market data simulation thread
+│   ├── risk_engine.py      # Black-Scholes Greeks calculator
+│   └── start_server.sh     # Launch script
+├── client/
+│   ├── base_client.py      # Reusable connection helper
+│   ├── quant_client.py     # Quant: filtered views, derived tables
+│   ├── risk_client.py      # Risk: exposure monitoring, alerts
+│   └── pm_client.py        # PM: portfolio summary, P&L snapshots
+├── requirements-server.txt
+├── requirements-client.txt
+└── README.md
 ```
 
-### Extending the App
+## Published Server Tables
 
-#### Adding New Metrics
-1. Update the table schemas in `init_deephaven_tables()`
-2. Add calculation logic in `simulate_market_data()`
-3. Update frontend grid column definitions
+| Table | Description |
+|-------|-------------|
+| `prices_raw` | Append-only price ticks |
+| `prices_live` | Latest price per symbol (ticking) |
+| `risk_raw` | Append-only risk ticks |
+| `risk_live` | Latest risk per symbol (ticking) |
+| `portfolio_summary` | Aggregated portfolio metrics |
 
-#### Integrating Real Data Sources
-Replace the simulation with real market data:
-```python
-# Example: Replace with real data feed
-def get_real_market_data(self):
-    # Connect to your data provider
-    # Return price updates in same format
-    pass
-```
+## Client Capabilities
 
-## Performance
+| Feature | How |
+|---------|-----|
+| Read shared tables | `session.open_table("prices_live")` |
+| Filter / sort | `table.where(...)`, `table.sort(...)` |
+| Create server-side views | `session.run_script("...")` |
+| Publish tables | `session.bind_table(name, table)` |
+| Export to pandas | `table.to_arrow().to_pandas()` |
+| Subscribe to ticks | `pydeephaven-ticking` listener API |
 
-### Optimization Features
-- **Memory Management**: Tables limited to 1000 rows
-- **Efficient Updates**: Only changed data transmitted
-- **Async Processing**: Non-blocking data simulation
-- **Client-Side Caching**: Grids manage data efficiently
+## Symbols
 
-### Scaling Considerations
-- **Horizontal Scaling**: Multiple app instances behind load balancer
-- **Database Integration**: Persist data to external database
-- **Message Queue**: Use Redis/Kafka for high-throughput scenarios
-
-## Security Notes
-
-⚠️ **Development Use Only**
-- This is a demonstration application
-- Market data is simulated
-- Risk calculations are simplified
-- Not suitable for production trading
-
-## Troubleshooting
-
-### Common Issues
-
-#### Port Conflicts
-```bash
-# Change port in app.py
-trading_app.run(port=8081)  # Use different port
-```
-
-#### Dependency Issues
-```bash
-# Install specific Deephaven version
-pip install deephaven-core==0.32.0
-```
-
-#### Connection Problems
-- Check firewall settings
-- Verify WebSocket support
-- Ensure browser compatibility
-
-## Contributing
-
-### Development Setup
-1. Clone the repository
-2. Install dependencies
-3. Run the development server
-4. Make changes and test
-
-### Code Style
-- Follow PEP 8 for Python
-- Use semantic HTML5
-- Implement responsive design
-- Add comprehensive comments
+| Symbol | Base Price |
+|--------|-----------|
+| AAPL | $228 |
+| GOOGL | $192 |
+| MSFT | $415 |
+| AMZN | $225 |
+| TSLA | $355 |
+| NVDA | $138 |
+| META | $700 |
+| NFLX | $1,020 |
 
 ## License
 
-MIT License - feel free to use and modify for your projects.
-
-## Support
-
-For questions and issues:
-1. Check the troubleshooting section
-2. Review the code comments
-3. Test with different browsers
-4. Verify Deephaven installation
-
----
-
-**Built with ❤️ using Deephaven.io and modern web technologies**
+MIT
