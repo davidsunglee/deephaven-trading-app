@@ -25,6 +25,7 @@ from store.schema import provision_user
 from store.base import Storable, _JSONEncoder, _json_decoder_hook
 from store.client import StoreClient
 from store.state_machine import StateMachine, Transition, InvalidTransition, GuardFailure, TransitionNotPermitted
+from store.client import VersionConflict, QueryResult
 from store.permissions import share_read, share_write, unshare_read, unshare_write, list_shared_with
 
 
@@ -742,6 +743,252 @@ class TestCRUD:
         w = Widget(name="no_id_del", color="x", weight=1.0)
         with pytest.raises(ValueError):
             alice.delete(w)
+
+
+# ── Optimistic Concurrency ──────────────────────────────────────────────────
+
+class TestOptimisticConcurrency:
+    def test_update_succeeds_when_version_matches(self, alice):
+        """Normal update works — version is tracked automatically."""
+        w = Widget(name="occ_ok", color="v1", weight=1.0)
+        alice.write(w)
+        assert w._store_version == 1
+        w.color = "v2"
+        alice.update(w)  # auto-checks version 1 matches
+        assert w._store_version == 2
+
+    def test_stale_object_raises_version_conflict(self, alice):
+        """Two readers of the same version — second writer loses."""
+        w = Widget(name="occ_stale", color="v1", weight=1.0)
+        entity_id = alice.write(w)
+        # Simulate two readers
+        reader1 = alice.read(Widget, entity_id)
+        reader2 = alice.read(Widget, entity_id)
+        # Reader 1 writes successfully
+        reader1.color = "by_reader1"
+        alice.update(reader1)
+        # Reader 2 is now stale (still version 1, but DB is at version 2)
+        reader2.color = "by_reader2"
+        with pytest.raises(VersionConflict) as exc_info:
+            alice.update(reader2)
+        assert exc_info.value.expected_version == 1
+        assert exc_info.value.actual_version == 2
+
+    def test_delete_succeeds_when_version_matches(self, alice):
+        w = Widget(name="occ_del_ok", color="v1", weight=1.0)
+        alice.write(w)
+        alice.delete(w)  # auto-checks version 1
+        assert alice.read(Widget, w._store_entity_id) is None
+
+    def test_delete_stale_object_raises(self, alice):
+        w = Widget(name="occ_del_stale", color="v1", weight=1.0)
+        entity_id = alice.write(w)
+        stale = alice.read(Widget, entity_id)
+        # Update moves version to 2
+        w.color = "v2"
+        alice.update(w)
+        # stale is still version 1
+        with pytest.raises(VersionConflict):
+            alice.delete(stale)
+
+    def test_sequential_updates_succeed(self, alice):
+        """Each update advances _store_version, so the next one passes."""
+        w = Widget(name="occ_seq", color="v1", weight=1.0)
+        alice.write(w)
+        w.color = "v2"
+        alice.update(w)
+        w.color = "v3"
+        alice.update(w)
+        assert w._store_version == 3
+
+    def test_version_conflict_preserves_db_state(self, alice):
+        """Conflicted update does not change the stored data."""
+        w = Widget(name="occ_preserve", color="original", weight=1.0)
+        entity_id = alice.write(w)
+        stale = alice.read(Widget, entity_id)
+        w.color = "winner"
+        alice.update(w)
+        stale.color = "loser"
+        with pytest.raises(VersionConflict):
+            alice.update(stale)
+        loaded = alice.read(Widget, entity_id)
+        assert loaded.color == "winner"
+
+
+# ── Bulk Operations ─────────────────────────────────────────────────────────
+
+class TestBulkOperations:
+    def test_write_many(self, alice):
+        widgets = [Widget(name=f"bulk_{i}", color="x", weight=float(i)) for i in range(5)]
+        ids = alice.write_many(widgets)
+        assert len(ids) == 5
+        for i, w in enumerate(widgets):
+            assert w._store_entity_id == ids[i]
+            assert w._store_version == 1
+
+    def test_write_many_atomic_on_failure(self, alice):
+        """If one write fails, none should persist."""
+        before = alice.count(Widget)
+        widgets = [Widget(name=f"atomic_{i}", color="x", weight=1.0) for i in range(3)]
+        # Corrupt the third object to cause failure
+        widgets[2]._state_machine = "not_a_state_machine"
+        with pytest.raises(Exception):
+            alice.write_many(widgets)
+        # None should have persisted
+        after = alice.count(Widget)
+        assert after == before
+
+    def test_update_many(self, alice):
+        w1 = Widget(name="ubulk_1", color="a", weight=1.0)
+        w2 = Widget(name="ubulk_2", color="b", weight=2.0)
+        alice.write(w1)
+        alice.write(w2)
+        w1.color = "updated_a"
+        w2.color = "updated_b"
+        alice.update_many([w1, w2])
+        assert w1._store_version == 2
+        assert w2._store_version == 2
+        loaded1 = alice.read(Widget, w1._store_entity_id)
+        loaded2 = alice.read(Widget, w2._store_entity_id)
+        assert loaded1.color == "updated_a"
+        assert loaded2.color == "updated_b"
+
+    def test_update_many_auto_version_check(self, alice):
+        w1 = Widget(name="ubulk_ev1", color="a", weight=1.0)
+        w2 = Widget(name="ubulk_ev2", color="b", weight=2.0)
+        alice.write(w1)
+        alice.write(w2)
+        w1.color = "c"
+        w2.color = "d"
+        alice.update_many([w1, w2])
+        assert w1._store_version == 2
+        assert w2._store_version == 2
+
+    def test_update_many_rolls_back_on_conflict(self, alice):
+        w1 = Widget(name="ubulk_rb1", color="a", weight=1.0)
+        w2 = Widget(name="ubulk_rb2", color="b", weight=2.0)
+        alice.write(w1)
+        alice.write(w2)
+        # Read stale copy of w2
+        stale_w2 = alice.read(Widget, w2._store_entity_id)
+        # Update w2 so its version is now 2
+        w2.color = "sneaky"
+        alice.update(w2)
+        # Try bulk update — w1 is fine but stale_w2 will conflict
+        w1.color = "should_not_persist"
+        stale_w2.color = "conflict"
+        with pytest.raises(VersionConflict):
+            alice.update_many([w1, stale_w2])
+        # w1 should NOT have been updated (atomic rollback)
+        loaded1 = alice.read(Widget, w1._store_entity_id)
+        assert loaded1.color == "a"
+
+
+# ── Pagination ──────────────────────────────────────────────────────────────
+
+class TestPagination:
+    def test_query_returns_query_result(self, alice):
+        alice.write(Widget(name="page_test", color="x", weight=1.0))
+        result = alice.query(Widget)
+        assert isinstance(result, QueryResult)
+        assert len(result) >= 1
+        assert result.items is not None
+
+    def test_cursor_pagination(self, alice):
+        """Page through results using cursor."""
+        for i in range(5):
+            alice.write(Widget(name=f"paginate_{i}", color="x", weight=float(i)))
+            time.sleep(0.01)  # Ensure distinct tx_times
+
+        # First page: 3 items
+        page1 = alice.query(Widget, filters={"color": "x"}, limit=3)
+        assert len(page1) == 3
+        assert page1.next_cursor is not None
+
+        # Second page: use cursor
+        page2 = alice.query(Widget, filters={"color": "x"}, limit=3, cursor=page1.next_cursor)
+        assert len(page2) >= 1
+
+        # No overlap
+        ids1 = {w._store_entity_id for w in page1}
+        ids2 = {w._store_entity_id for w in page2}
+        assert ids1.isdisjoint(ids2)
+
+    def test_last_page_has_no_cursor(self, alice):
+        w = Widget(name="last_page_test", color="unique_lp", weight=1.0)
+        alice.write(w)
+        result = alice.query(Widget, filters={"color": "unique_lp"}, limit=100)
+        assert result.next_cursor is None
+
+    def test_query_result_iterable(self, alice):
+        alice.write(Widget(name="iter_test", color="x", weight=1.0))
+        result = alice.query(Widget, filters={"name": "iter_test"})
+        names = [w.name for w in result]
+        assert "iter_test" in names
+
+    def test_query_result_indexable(self, alice):
+        alice.write(Widget(name="idx_test", color="unique_idx", weight=1.0))
+        result = alice.query(Widget, filters={"color": "unique_idx"})
+        assert result[0].name == "idx_test"
+
+
+# ── Audit Log ───────────────────────────────────────────────────────────────
+
+class TestAuditLog:
+    def test_audit_returns_all_events(self, alice):
+        w = Widget(name="audit_test", color="v1", weight=1.0)
+        alice.write(w)
+        w.color = "v2"
+        alice.update(w)
+        w.color = "v3"
+        alice.update(w)
+
+        trail = alice.audit(w._store_entity_id)
+        assert len(trail) == 3
+        assert trail[0]["version"] == 1
+        assert trail[0]["event_type"] == "CREATED"
+        assert trail[1]["version"] == 2
+        assert trail[1]["event_type"] == "UPDATED"
+        assert trail[2]["version"] == 3
+
+    def test_audit_includes_updated_by(self, alice):
+        w = Widget(name="audit_by", color="v1", weight=1.0)
+        alice.write(w)
+        trail = alice.audit(w._store_entity_id)
+        assert trail[0]["updated_by"] == "alice"
+
+    def test_audit_includes_state_changes(self, alice):
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "FILLED")
+        alice.transition(o, "SETTLED")
+
+        trail = alice.audit(o._store_entity_id)
+        assert len(trail) == 3
+        states = [e["state"] for e in trail]
+        assert states == ["PENDING", "FILLED", "SETTLED"]
+        assert trail[1]["event_meta"]["from_state"] == "PENDING"
+        assert trail[1]["event_meta"]["to_state"] == "FILLED"
+
+    def test_audit_includes_delete_tombstone(self, alice):
+        w = Widget(name="audit_del", color="v1", weight=1.0)
+        alice.write(w)
+        alice.delete(w)
+        trail = alice.audit(w._store_entity_id)
+        assert len(trail) == 2
+        assert trail[-1]["event_type"] == "DELETED"
+
+    def test_audit_tx_times_ascending(self, alice):
+        w = Widget(name="audit_time", color="v1", weight=1.0)
+        alice.write(w)
+        w.color = "v2"
+        alice.update(w)
+        trail = alice.audit(w._store_entity_id)
+        assert trail[0]["tx_time"] <= trail[1]["tx_time"]
+
+    def test_audit_empty_for_nonexistent(self, alice):
+        trail = alice.audit(str(uuid.uuid4()))
+        assert trail == []
 
 
 # ── RLS Isolation (zero-trust core) ─────────────────────────────────────────

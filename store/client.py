@@ -17,6 +17,36 @@ from store.base import Storable, _JSONEncoder, _json_decoder_hook
 from store.state_machine import InvalidTransition, GuardFailure, TransitionNotPermitted
 
 
+class VersionConflict(Exception):
+    """Raised when optimistic concurrency check fails."""
+
+    def __init__(self, entity_id, expected_version, actual_version):
+        self.entity_id = entity_id
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        super().__init__(
+            f"Version conflict on entity {entity_id}: "
+            f"expected {expected_version}, actual {actual_version}"
+        )
+
+
+class QueryResult:
+    """Result of a paginated query. Contains items and an optional next_cursor."""
+
+    def __init__(self, items, next_cursor=None):
+        self.items = items
+        self.next_cursor = next_cursor
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+
 class StoreClient:
     """
     Connects to the object store as a specific user.
@@ -84,11 +114,20 @@ class StoreClient:
         """
         Create a new version of an existing entity (never overwrites).
         Automatically determines event_type: UPDATED or CORRECTED (if backdated).
+
+        Optimistic concurrency is automatic: if someone else wrote a new
+        version since you read this object, raises VersionConflict.
         """
         if not obj._store_entity_id:
             raise ValueError("Object has no entity_id — write() it first")
 
         next_ver = self._next_version(obj._store_entity_id)
+
+        # Automatic optimistic concurrency: obj._store_version must match
+        if obj._store_version is not None:
+            actual = next_ver - 1
+            if actual != obj._store_version:
+                raise VersionConflict(obj._store_entity_id, obj._store_version, actual)
         json_data = obj.to_json()
         type_name = obj.type_name()
 
@@ -144,11 +183,19 @@ class StoreClient:
         """
         Soft-delete: creates a DELETED tombstone event.
         The entity disappears from read()/query() but remains in history().
+
+        Optimistic concurrency is automatic.
         """
         if not obj._store_entity_id:
             raise ValueError("Object has no entity_id — write() it first")
 
         next_ver = self._next_version(obj._store_entity_id)
+
+        # Automatic optimistic concurrency
+        if obj._store_version is not None:
+            actual = next_ver - 1
+            if actual != obj._store_version:
+                raise VersionConflict(obj._store_entity_id, obj._store_version, actual)
         type_name = obj.type_name()
         json_data = obj.to_json()
 
@@ -258,6 +305,43 @@ class StoreClient:
             t.action(obj, current_state, new_state)
         sm.fire_on_enter(new_state, obj, current_state, new_state)
 
+    def write_many(self, objects, valid_from=None):
+        """
+        Write multiple new entities in a single transaction.
+        Returns list of entity_ids.
+        """
+        old_autocommit = self.conn.autocommit
+        self.conn.autocommit = False
+        try:
+            entity_ids = []
+            for obj in objects:
+                eid = self.write(obj, valid_from=valid_from)
+                entity_ids.append(eid)
+            self.conn.commit()
+            return entity_ids
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            self.conn.autocommit = old_autocommit
+
+    def update_many(self, objects, valid_from=None):
+        """
+        Update multiple entities in a single transaction.
+        Optimistic concurrency is automatic on each entity.
+        """
+        old_autocommit = self.conn.autocommit
+        self.conn.autocommit = False
+        try:
+            for obj in objects:
+                self.update(obj, valid_from=valid_from)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            self.conn.autocommit = old_autocommit
+
     # ── Read operations ───────────────────────────────────────────────
 
     def read(self, cls, entity_id):
@@ -286,12 +370,15 @@ class StoreClient:
                 return None
             return self._row_to_object(cls, row)
 
-    def query(self, cls, filters=None, limit=100):
+    def query(self, cls, filters=None, limit=100, cursor=None):
         """
         Query current (latest non-deleted) entities of a given type.
 
         filters: dict of key-value pairs matched against the data column.
             e.g. {"symbol": "AAPL"} → data @> '{"symbol": "AAPL"}'
+
+        Pagination: pass cursor=next_cursor from a previous QueryResult to
+        get the next page. Returns a QueryResult with .items and .next_cursor.
         """
         type_name = cls.type_name()
         params = [type_name]
@@ -312,10 +399,16 @@ class StoreClient:
 
         sql += " ORDER BY entity_id, version DESC"
 
-        # Wrap to filter out DELETED and apply limit
+        # Wrap to filter out DELETED, apply cursor + limit
+        cursor_clause = ""
+        if cursor is not None:
+            cursor_clause = "AND tx_time < %s"
+            params.append(cursor)
+
         wrapped = f"""
             SELECT * FROM ({sql}) sub
             WHERE event_type != 'DELETED'
+            {cursor_clause}
             ORDER BY tx_time DESC
             LIMIT %s
         """
@@ -324,7 +417,13 @@ class StoreClient:
         with self.conn.cursor() as cur:
             cur.execute(wrapped, params)
             rows = cur.fetchall()
-            return [self._row_to_object(cls, row) for row in rows]
+            items = [self._row_to_object(cls, row) for row in rows]
+
+        next_cursor = None
+        if len(items) == limit:
+            next_cursor = items[-1]._store_tx_time
+
+        return QueryResult(items=items, next_cursor=next_cursor)
 
     def history(self, cls, entity_id):
         """
@@ -414,6 +513,37 @@ class StoreClient:
                     """
                 )
             return cur.fetchone()[0]
+
+    def audit(self, entity_id):
+        """
+        Return the full audit trail for an entity: who changed what, when.
+        Returns list of AuditEntry dicts ordered by version.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT version, event_type, owner, updated_by, state,
+                       event_meta, tx_time, valid_from
+                FROM object_events
+                WHERE entity_id = %s
+                ORDER BY version ASC
+                """,
+                (entity_id,),
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    "version": row[0],
+                    "event_type": row[1],
+                    "owner": row[2],
+                    "updated_by": row[3],
+                    "state": row[4],
+                    "event_meta": row[5],
+                    "tx_time": row[6],
+                    "valid_from": row[7],
+                }
+                for row in rows
+            ]
 
     def list_types(self):
         """List distinct type_names visible to the current user."""

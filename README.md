@@ -156,6 +156,56 @@ client.update(trade, valid_from=datetime(2026, 2, 22, 10, 0, tzinfo=timezone.utc
 # event_type automatically set to "CORRECTED"
 ```
 
+### Optimistic Concurrency (Automatic)
+
+```python
+# Framework tracks versions automatically — no user action needed
+trade = client.read(Trade, entity_id)          # _store_version=3
+trade.price = 152.0
+client.update(trade)                           # checks version 3 → succeeds → now version 4
+
+# If someone else updated in between, raises VersionConflict
+stale = client.read(Trade, entity_id)          # _store_version=4
+# ... someone else updates to version 5 ...
+stale.price = 999.0
+client.update(stale)                           # raises VersionConflict (expected 4, actual 5)
+```
+
+### Bulk Operations
+
+```python
+# Atomic batch write — all-or-nothing
+orders = [Order(symbol=s, quantity=100, price=0.0, side="BUY") for s in ["AAPL", "GOOG", "MSFT"]]
+entity_ids = client.write_many(orders)         # single transaction
+
+# Atomic batch update — version checks are automatic
+client.update_many([o1, o2, o3])
+```
+
+### Pagination
+
+```python
+# Cursor-based pagination
+page1 = client.query(Trade, filters={"side": "BUY"}, limit=50)
+for trade in page1:
+    process(trade)
+
+if page1.next_cursor:
+    page2 = client.query(Trade, filters={"side": "BUY"}, limit=50, cursor=page1.next_cursor)
+```
+
+### Audit Log
+
+```python
+# Full audit trail: who changed what, when
+trail = client.audit(entity_id)
+for entry in trail:
+    print(f"v{entry['version']} {entry['event_type']} by {entry['updated_by']} at {entry['tx_time']}")
+# v1 CREATED by alice at 2026-02-22 10:00:00
+# v2 UPDATED by bob at 2026-02-22 10:05:00
+# v3 STATE_CHANGE by alice at 2026-02-22 10:10:00
+```
+
 ### Event Types
 
 | Type | Meaning |
@@ -297,7 +347,7 @@ windsurf-project/
 │   ├── graph.py            # ReactiveGraph (Signal/Computed/Effect)
 │   └── bridge.py           # Auto-persist effect factory
 ├── tests/
-│   ├── test_store.py       # Bi-temporal + state machine + RLS tests (89)
+│   ├── test_store.py       # Bi-temporal + state machine + RLS tests (111)
 │   ├── test_reactive.py    # Generic expression + graph tests (118)
 │   └── test_reactive_finance.py  # Finance domain tests (49)
 ├── requirements-server.txt
