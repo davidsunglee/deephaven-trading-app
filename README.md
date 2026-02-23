@@ -273,6 +273,42 @@ for v in client.history(Order, order._store_entity_id):
     print(f"v{v._store_version}: {v._store_state} by {v._store_updated_by}")
 ```
 
+## Cross-Entity Reactive Computations
+
+Aggregate computations that span multiple tracked objects and auto-recompute when any member changes:
+
+```python
+from reactive.graph import ReactiveGraph
+from reactive.expr import Field
+
+graph = ReactiveGraph()
+n1 = graph.track(position_aapl)   # quantity=100, price=228
+n2 = graph.track(position_goog)   # quantity=50, price=192
+
+# Per-entity computeds
+mv = Field("price") * Field("quantity")
+graph.computed(n1, "mv", mv)
+graph.computed(n2, "mv", mv)
+
+# group_computed — aggregate across nodes
+graph.group_computed("portfolio_value", [n1, n2], "mv", sum)
+print(graph.get_group("portfolio_value"))   # 32400.0
+
+# multi_computed — arbitrary cross-node function
+graph.multi_computed("spread", lambda g: g.get(n1, "mv") - g.get(n2, "mv"))
+
+# Dynamic membership — add/remove nodes
+n3 = graph.track(position_tsla)
+graph.computed(n3, "mv", mv)
+graph.add_to_group("portfolio_value", n3)
+
+# Updates propagate through the entire graph
+graph.update(n1, "price", 230.0)           # portfolio_value auto-recomputes
+
+# group_effect — fire on group changes
+graph.group_effect("portfolio_value", lambda name, val: alert_if_low(val))
+```
+
 ## Reactive Expression Language
 
 A typed expression tree that builds at definition time and compiles to three targets:
@@ -344,11 +380,11 @@ windsurf-project/
 │   └── permissions.py      # Share/unshare entities between users
 ├── reactive/
 │   ├── expr.py             # Expression tree (eval/to_sql/to_pure)
-│   ├── graph.py            # ReactiveGraph (Signal/Computed/Effect)
+│   ├── graph.py            # ReactiveGraph (Signal/Computed/Effect/Groups)
 │   └── bridge.py           # Auto-persist effect factory
 ├── tests/
 │   ├── test_store.py       # Bi-temporal + state machine + RLS tests (111)
-│   ├── test_reactive.py    # Generic expression + graph tests (118)
+│   ├── test_reactive.py    # Expression + graph + cross-entity tests (137)
 │   └── test_reactive_finance.py  # Finance domain tests (49)
 ├── requirements-server.txt
 ├── requirements-client.txt

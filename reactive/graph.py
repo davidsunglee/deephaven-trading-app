@@ -26,6 +26,7 @@ class ReactiveGraph:
 
     def __init__(self):
         self._nodes = {}       # node_id → _TrackedNode
+        self._groups = {}      # name → _GroupNode
 
     def track(self, obj) -> str:
         """
@@ -151,6 +152,130 @@ class ReactiveGraph:
         node.computeds.clear()
         node.signals.clear()
 
+    # ── Cross-entity group computations ──────────────────────────────
+
+    def group_computed(self, name, node_ids, computed_name, reduce_fn):
+        """
+        Aggregate a named computed value across multiple nodes.
+
+        Args:
+            name: unique name for this group computation
+            node_ids: list of node_id strings to aggregate
+            computed_name: name of the per-node computed to aggregate
+            reduce_fn: callable that takes a list of values (e.g. sum, max)
+
+        The group auto-recomputes when any member's computed changes
+        or when nodes are added/removed via add_to_group/remove_from_group.
+        """
+        if name in self._groups:
+            raise KeyError(f"Group '{name}' already exists")
+
+        # Signal holding the member list — mutating it triggers recomputation
+        ids_signal = Signal(list(node_ids))
+
+        graph_ref = self
+
+        def compute():
+            members = ids_signal()
+            values = []
+            for nid in members:
+                if nid in graph_ref._nodes:
+                    node = graph_ref._nodes[nid]
+                    if computed_name in node.computeds:
+                        values.append(node.computeds[computed_name]())
+            return reduce_fn(values)
+
+        group = _GroupNode(
+            computed=Computed(compute),
+            node_ids_signal=ids_signal,
+            computed_name=computed_name,
+            reduce_fn=reduce_fn,
+        )
+        self._groups[name] = group
+
+    def multi_computed(self, name, fn):
+        """
+        Define an arbitrary cross-node computed.
+
+        fn(graph) is called with the ReactiveGraph instance.
+        Use graph.get(node_id, name) and graph.get_field(node_id, field)
+        inside fn to read from any tracked node — dependencies are
+        automatically tracked by the signal graph.
+
+        Example:
+            graph.multi_computed("spread", lambda g: g.get(n1, "mv") - g.get(n2, "mv"))
+        """
+        if name in self._groups:
+            raise KeyError(f"Group '{name}' already exists")
+
+        graph_ref = self
+
+        def compute():
+            return fn(graph_ref)
+
+        group = _GroupNode(computed=Computed(compute), fn=fn)
+        self._groups[name] = group
+
+    def get_group(self, name):
+        """Read the current value of a group or multi computed."""
+        if name not in self._groups:
+            raise KeyError(f"No group '{name}'")
+        return self._groups[name].computed()
+
+    def group_effect(self, name, callback):
+        """
+        Attach a side-effect that fires when a group computed changes.
+        callback(name, value) is called with the group name and new value.
+        """
+        if name not in self._groups:
+            raise KeyError(f"No group '{name}'")
+
+        group = self._groups[name]
+        group_name = name
+
+        def effect_fn():
+            value = group.computed()
+            callback(group_name, value)
+
+        eff = Effect(effect_fn)
+        group.effects[f"_effect_{len(group.effects)}"] = eff
+        self._tick()
+
+    def add_to_group(self, name, node_id):
+        """Dynamically add a node to a group_computed. Triggers recomputation."""
+        if name not in self._groups:
+            raise KeyError(f"No group '{name}'")
+        group = self._groups[name]
+        if group.node_ids_signal is None:
+            raise ValueError(f"Group '{name}' is a multi_computed — use group_computed for dynamic membership")
+        current = list(group.node_ids_signal())
+        if node_id not in current:
+            current.append(node_id)
+            group.node_ids_signal.set(current)
+            self._tick()
+
+    def remove_from_group(self, name, node_id):
+        """Dynamically remove a node from a group_computed. Triggers recomputation."""
+        if name not in self._groups:
+            raise KeyError(f"No group '{name}'")
+        group = self._groups[name]
+        if group.node_ids_signal is None:
+            raise ValueError(f"Group '{name}' is a multi_computed — use group_computed for dynamic membership")
+        current = list(group.node_ids_signal())
+        if node_id in current:
+            current.remove(node_id)
+            group.node_ids_signal.set(current)
+            self._tick()
+
+    def remove_group(self, name):
+        """Tear down a group computed and its effects."""
+        group = self._groups.pop(name, None)
+        if group is None:
+            return
+        for eff in group.effects.values():
+            eff.dispose()
+        group.effects.clear()
+
     def _get_node(self, node_id: str):
         if node_id not in self._nodes:
             raise KeyError(f"Node {node_id} not tracked")
@@ -178,3 +303,17 @@ class _TrackedNode:
         self.signals = signals
         self.computeds = computeds
         self.effects = effects
+
+
+class _GroupNode:
+    """Internal state for a cross-entity group computation."""
+
+    __slots__ = ("computed", "effects", "node_ids_signal", "computed_name", "reduce_fn", "fn")
+
+    def __init__(self, computed, node_ids_signal=None, computed_name=None, reduce_fn=None, fn=None):
+        self.computed = computed
+        self.effects = {}
+        self.node_ids_signal = node_ids_signal
+        self.computed_name = computed_name
+        self.reduce_fn = reduce_fn
+        self.fn = fn

@@ -701,3 +701,231 @@ class TestReactiveGraph:
         result = graph.get(node_id, "celsius")
         expected = (212.0 - 32) * 5 / 9
         assert abs(result - expected) < 0.001
+
+
+# ===========================================================================
+# Cross-entity reactive tests
+# ===========================================================================
+
+@dataclass
+class Position(Storable):
+    symbol: str = ""
+    quantity: int = 0
+    price: float = 0.0
+
+
+class TestGroupComputed:
+    def test_sum_across_nodes(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        p2 = Position(symbol="GOOG", quantity=50, price=192.0)
+        n1 = graph.track(p1)
+        n2 = graph.track(p2)
+
+        mv = Field("price") * Field("quantity")
+        graph.computed(n1, "mv", mv)
+        graph.computed(n2, "mv", mv)
+
+        graph.group_computed("portfolio_value", [n1, n2], "mv", sum)
+        assert graph.get_group("portfolio_value") == 100 * 228.0 + 50 * 192.0
+
+    def test_max_across_nodes(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        p2 = Position(symbol="GOOG", quantity=50, price=192.0)
+        n1 = graph.track(p1)
+        n2 = graph.track(p2)
+
+        mv = Field("price") * Field("quantity")
+        graph.computed(n1, "mv", mv)
+        graph.computed(n2, "mv", mv)
+
+        graph.group_computed("max_mv", [n1, n2], "mv", max)
+        assert graph.get_group("max_mv") == 100 * 228.0
+
+    def test_recomputes_on_member_update(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        p2 = Position(symbol="GOOG", quantity=50, price=192.0)
+        n1 = graph.track(p1)
+        n2 = graph.track(p2)
+
+        mv = Field("price") * Field("quantity")
+        graph.computed(n1, "mv", mv)
+        graph.computed(n2, "mv", mv)
+
+        graph.group_computed("total", [n1, n2], "mv", sum)
+        before = graph.get_group("total")
+
+        graph.update(n1, "price", 230.0)
+        after = graph.get_group("total")
+
+        assert after == 100 * 230.0 + 50 * 192.0
+        assert after != before
+
+    def test_single_node_group(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        n1 = graph.track(p1)
+        graph.computed(n1, "mv", Field("price") * Field("quantity"))
+
+        graph.group_computed("solo", [n1], "mv", sum)
+        assert graph.get_group("solo") == 100 * 228.0
+
+    def test_empty_group(self):
+        graph = ReactiveGraph()
+        graph.group_computed("empty", [], "mv", sum)
+        assert graph.get_group("empty") == 0
+
+    def test_custom_reduce(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        p2 = Position(symbol="GOOG", quantity=50, price=192.0)
+        n1 = graph.track(p1)
+        n2 = graph.track(p2)
+
+        graph.computed(n1, "mv", Field("price") * Field("quantity"))
+        graph.computed(n2, "mv", Field("price") * Field("quantity"))
+
+        # Average
+        graph.group_computed("avg_mv", [n1, n2], "mv",
+                            lambda vals: sum(vals) / len(vals) if vals else 0)
+        expected = (100 * 228.0 + 50 * 192.0) / 2
+        assert graph.get_group("avg_mv") == expected
+
+    def test_duplicate_group_name_raises(self):
+        graph = ReactiveGraph()
+        graph.group_computed("x", [], "mv", sum)
+        with pytest.raises(KeyError):
+            graph.group_computed("x", [], "mv", sum)
+
+
+class TestMultiComputed:
+    def test_spread_between_nodes(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        p2 = Position(symbol="GOOG", quantity=50, price=192.0)
+        n1 = graph.track(p1)
+        n2 = graph.track(p2)
+
+        graph.computed(n1, "mv", Field("price") * Field("quantity"))
+        graph.computed(n2, "mv", Field("price") * Field("quantity"))
+
+        graph.multi_computed("spread", lambda g: g.get(n1, "mv") - g.get(n2, "mv"))
+        assert graph.get_group("spread") == (100 * 228.0) - (50 * 192.0)
+
+    def test_reads_raw_fields(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        p2 = Position(symbol="GOOG", quantity=50, price=192.0)
+        n1 = graph.track(p1)
+        n2 = graph.track(p2)
+
+        graph.multi_computed("total_qty",
+                            lambda g: g.get_field(n1, "quantity") + g.get_field(n2, "quantity"))
+        assert graph.get_group("total_qty") == 150
+
+    def test_recomputes_on_field_update(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        p2 = Position(symbol="GOOG", quantity=50, price=192.0)
+        n1 = graph.track(p1)
+        n2 = graph.track(p2)
+
+        graph.multi_computed("total_qty",
+                            lambda g: g.get_field(n1, "quantity") + g.get_field(n2, "quantity"))
+
+        graph.update(n1, "quantity", 200)
+        assert graph.get_group("total_qty") == 250
+
+
+class TestDynamicMembership:
+    def test_add_to_group(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        p2 = Position(symbol="GOOG", quantity=50, price=192.0)
+        n1 = graph.track(p1)
+        n2 = graph.track(p2)
+
+        mv = Field("price") * Field("quantity")
+        graph.computed(n1, "mv", mv)
+        graph.computed(n2, "mv", mv)
+
+        graph.group_computed("total", [n1], "mv", sum)
+        assert graph.get_group("total") == 100 * 228.0
+
+        graph.add_to_group("total", n2)
+        assert graph.get_group("total") == 100 * 228.0 + 50 * 192.0
+
+    def test_remove_from_group(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        p2 = Position(symbol="GOOG", quantity=50, price=192.0)
+        n1 = graph.track(p1)
+        n2 = graph.track(p2)
+
+        mv = Field("price") * Field("quantity")
+        graph.computed(n1, "mv", mv)
+        graph.computed(n2, "mv", mv)
+
+        graph.group_computed("total", [n1, n2], "mv", sum)
+        graph.remove_from_group("total", n2)
+        assert graph.get_group("total") == 100 * 228.0
+
+    def test_add_duplicate_is_noop(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        n1 = graph.track(p1)
+        graph.computed(n1, "mv", Field("price") * Field("quantity"))
+
+        graph.group_computed("total", [n1], "mv", sum)
+        graph.add_to_group("total", n1)  # already in group
+        assert graph.get_group("total") == 100 * 228.0
+
+    def test_add_to_multi_computed_raises(self):
+        graph = ReactiveGraph()
+        graph.multi_computed("x", lambda g: 42)
+        with pytest.raises(ValueError):
+            graph.add_to_group("x", "fake_id")
+
+
+class TestGroupEffect:
+    def test_effect_fires_on_change(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        n1 = graph.track(p1)
+        graph.computed(n1, "mv", Field("price") * Field("quantity"))
+        graph.group_computed("total", [n1], "mv", sum)
+
+        fired = []
+        graph.group_effect("total", lambda name, val: fired.append((name, val)))
+
+        graph.update(n1, "price", 230.0)
+        assert any(v == 100 * 230.0 for _, v in fired)
+
+    def test_effect_on_nonexistent_raises(self):
+        graph = ReactiveGraph()
+        with pytest.raises(KeyError):
+            graph.group_effect("nope", lambda n, v: None)
+
+
+class TestRemoveGroup:
+    def test_remove_group_cleanup(self):
+        graph = ReactiveGraph()
+        p1 = Position(symbol="AAPL", quantity=100, price=228.0)
+        n1 = graph.track(p1)
+        graph.computed(n1, "mv", Field("price") * Field("quantity"))
+        graph.group_computed("total", [n1], "mv", sum)
+
+        graph.remove_group("total")
+        with pytest.raises(KeyError):
+            graph.get_group("total")
+
+    def test_remove_nonexistent_is_noop(self):
+        graph = ReactiveGraph()
+        graph.remove_group("does_not_exist")  # should not raise
+
+    def test_get_group_nonexistent_raises(self):
+        graph = ReactiveGraph()
+        with pytest.raises(KeyError):
+            graph.get_group("nope")
