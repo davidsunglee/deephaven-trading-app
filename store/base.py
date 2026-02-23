@@ -87,6 +87,21 @@ class Storable:
     # Optional state machine — set on the class by the user
     _state_machine = None
 
+    # Column registry — mandatory enforcement for all subclasses
+    _registry = None
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if cls._registry is not None:
+            # __init_subclass__ fires BEFORE @dataclass, so we use
+            # __annotations__ (not dataclasses.fields) to check columns.
+            own_annotations = {
+                k: v for k, v in getattr(cls, '__annotations__', {}).items()
+                if not k.startswith('_')
+            }
+            if own_annotations:
+                cls._registry.validate_class(cls)
+
     def to_json(self) -> str:
         """Serialize this object to a JSON string for JSONB storage."""
         if dataclasses.is_dataclass(self):
@@ -116,3 +131,8 @@ class Storable:
     def type_name(cls) -> str:
         """The type identifier stored in the database."""
         return f"{cls.__module__}.{cls.__qualname__}"
+
+
+# ── Wire mandatory column registry (no circular import — columns/ does not import base) ──
+from store.columns import REGISTRY  # noqa: E402
+Storable._registry = REGISTRY

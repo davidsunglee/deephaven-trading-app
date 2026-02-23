@@ -664,7 +664,7 @@ class TestReactiveGraph:
         graph = ReactiveGraph()
 
         @dataclass
-        class Config(Storable):
+        class Config:
             override: object = None
             default: float = 10.0
 

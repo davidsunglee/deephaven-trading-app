@@ -82,7 +82,7 @@ class Gadget(Storable):
 @dataclass
 class RichItem(Storable):
     title: str = ""
-    amount: Decimal = Decimal("0")
+    amount: float = 0.0
     created: Optional[datetime] = None
     active: bool = True
     notes: Optional[str] = None

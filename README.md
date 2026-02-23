@@ -29,6 +29,10 @@ A **server/client** real-time trading platform built on [Deephaven.io](https://d
 │  • Append-only: never overwrite, full audit trail    │
 │  • Declarative state machines for lifecycle mgmt     │
 │  • owner + updated_by on every event for audit       │
+│  • Column Registry: enforced schema catalog          │
+│    – Every field must be pre-approved in registry    │
+│    – AI metadata: synonyms, sample values, types     │
+│    – OLAP: dimension/measure/attribute + units       │
 └───────────────────────┬──────────────────────────────┘
                         │
 ┌───────────────────────▼──────────────────────────────┐
@@ -370,6 +374,91 @@ for entry in trail:
 | `STATE_CHANGE` | Lifecycle state transition |
 | `CORRECTED` | Backdated correction (`valid_from` in the past) |
 
+## Column Registry
+
+**Enforced schema catalog** — every field on every `Storable` must be pre-approved in the column registry. No rogue columns.
+
+```python
+from store.columns import REGISTRY
+
+# Define canonical columns (done once in store/columns/)
+REGISTRY.define("symbol", str,
+    description="Financial instrument ticker symbol",
+    semantic_type="identifier", role="dimension",
+    synonyms=["ticker", "instrument", "security"],
+    sample_values=["AAPL", "GOOGL", "MSFT"],
+    max_length=12, pattern=r"^[A-Z0-9./]+$",
+)
+
+REGISTRY.define("price", float,
+    description="Trade execution price",
+    semantic_type="currency_amount", role="measure",
+    unit="USD", min_value=0, format=",.2f",
+    synonyms=["px", "execution price"],
+)
+
+# Prefixed columns: base column controls allowed prefixes
+REGISTRY.define("name", str,
+    description="Person name", role="dimension",
+    allowed_prefixes=["trader", "salesperson", "client"],
+)
+# Now trader_name, salesperson_name, client_name are valid — random_name is rejected
+```
+
+### Enforcement
+
+Every `Storable` subclass is validated at **class-definition time**:
+
+```python
+@dataclass
+class Trade(Storable):
+    symbol: str = ""         # ✅ registered column, type matches
+    trader_name: str = ""    # ✅ prefix "trader" approved on "name" column
+    price: float = 0.0       # ✅ registered column
+
+@dataclass
+class Bad(Storable):
+    foo: str = ""            # ❌ RegistryError: 'foo' not in registry
+    price: str = ""          # ❌ RegistryError: type str ≠ float
+    random_name: str = ""    # ❌ RegistryError: prefix "random" not approved
+```
+
+### ColumnDef Metadata
+
+Each column captures rich metadata across 7 categories:
+
+| Category | Fields | Purpose |
+|----------|--------|---------|
+| **Core** | name, python_type, nullable, default | Type system |
+| **Constraints** | enum, min/max, max_length, pattern | Validation |
+| **AI / Semantic** | description, synonyms, sample_values, semantic_type | NL queries, LLM tools |
+| **OLAP** | role (dim/measure/attr), aggregation, unit | Analytics |
+| **Display** | display_name, format, category | UI rendering |
+| **Governance** | sensitivity, deprecated, tags | Data governance |
+| **Cross-Layer** | legend_type, dh_type_override | Legend / DH hints |
+
+Measures **require** `unit` (enforced at `define()` time). All columns require `role` and `description`.
+
+### Column Catalog Organization
+
+```
+store/columns/
+  __init__.py    # REGISTRY global instance
+  trading.py     # symbol, price, quantity, side, pnl, order_type, ...
+  finance.py     # bid, ask, strike, volatility, notional, isin, ...
+  general.py     # name, label, title, color, weight, status, ...
+```
+
+### Introspection
+
+```python
+REGISTRY.resolve("trader_name")        # → (ColumnDef("name"), "trader")
+REGISTRY.entities_with("symbol")       # → [Trade, Order, Signal, ...]
+REGISTRY.columns_for(Trade)            # → [ColumnDef("symbol"), ColumnDef("price"), ...]
+REGISTRY.prefixed_columns("name")      # → ["trader_name", "salesperson_name", "client_name"]
+REGISTRY.validate_instance(trade_obj)  # runtime constraint checks
+```
+
 ## State Machines
 
 Declarative lifecycle management with **guards**, **actions**, **hooks**, and **per-transition permissions**:
@@ -526,6 +615,12 @@ windsurf-project/
 │   └── pm_client.py        # PM: portfolio summary, P&L snapshots
 ├── store/
 │   ├── base.py             # Storable base class + bi-temporal metadata
+│   ├── registry.py         # ColumnDef, ColumnRegistry, RegistryError
+│   ├── columns/            # Column catalog (single source of truth)
+│   │   ├── __init__.py     # REGISTRY global instance
+│   │   ├── trading.py      # symbol, price, quantity, side, pnl, ...
+│   │   ├── finance.py      # bid, ask, strike, volatility, notional, ...
+│   │   └── general.py      # name, label, title, status, weight, ...
 │   ├── models.py           # Domain models: Trade, Order, Signal
 │   ├── server.py           # Embedded PG server bootstrap
 │   ├── client.py           # StoreClient (event-sourced, bi-temporal)
@@ -548,7 +643,8 @@ windsurf-project/
 │   ├── test_reactive.py    # Expression + graph + cross-entity tests (137)
 │   ├── test_reactive_finance.py  # Finance domain tests (49)
 │   ├── test_workflow.py    # Workflow engine tests (16)
-│   └── test_bridge.py      # DH ↔ Store bridge tests, real DH + PG (17)
+│   ├── test_bridge.py      # DH ↔ Store bridge tests, real DH + PG (17)
+│   └── test_registry.py    # Column registry enforcement tests (56)
 ├── demo_bridge.py          # Interactive demo: store + graph → DH ticking tables
 ├── requirements-server.txt
 ├── requirements-client.txt

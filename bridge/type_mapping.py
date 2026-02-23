@@ -61,6 +61,9 @@ def infer_dh_schema(storable_cls):
 
     Metadata columns (EntityId, Version, EventType, State, UpdatedBy, TxTime)
     are always prepended. Domain columns follow from the dataclass fields.
+
+    When a ColumnRegistry is available on the class, uses ColumnDef.python_type
+    for canonical type resolution instead of raw annotation inference.
     """
     schema = OrderedDict()
 
@@ -70,9 +73,18 @@ def infer_dh_schema(storable_cls):
 
     # Domain columns from dataclass fields
     if dataclasses.is_dataclass(storable_cls):
+        registry = getattr(storable_cls, '_registry', None)
         hints = get_type_hints(storable_cls)
         for field in dataclasses.fields(storable_cls):
-            py_type = hints.get(field.name, str)
+            # Prefer registry's canonical type when available
+            if registry is not None:
+                try:
+                    col_def, _ = registry.resolve(field.name)
+                    py_type = col_def.python_type
+                except Exception:
+                    py_type = hints.get(field.name, str)
+            else:
+                py_type = hints.get(field.name, str)
             schema[field.name] = _get_dh_type(py_type)
 
     return schema

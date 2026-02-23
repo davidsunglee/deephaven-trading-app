@@ -85,7 +85,7 @@ def client(conn_info, _provision_users):
 @dataclass
 class Counter(Storable):
     name: str = ""
-    value: int = 0
+    value: float = 0
 
 
 @dataclass
