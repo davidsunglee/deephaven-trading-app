@@ -132,6 +132,42 @@ def bootstrap_schema(admin_conn):
         # ── Grant table permissions to group role ────────────────────
         cur.execute(f"GRANT SELECT, INSERT, UPDATE ON object_events TO {GROUP_ROLE};")
 
+        # ── NOTIFY trigger: fires on every INSERT ────────────────────
+        cur.execute("""
+            CREATE OR REPLACE FUNCTION notify_object_event() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('object_events', json_build_object(
+                    'entity_id', NEW.entity_id,
+                    'version', NEW.version,
+                    'event_type', NEW.event_type,
+                    'type_name', NEW.type_name,
+                    'updated_by', NEW.updated_by,
+                    'state', NEW.state,
+                    'tx_time', NEW.tx_time
+                )::text);
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+        """)
+        cur.execute("""
+            DROP TRIGGER IF EXISTS object_event_notify ON object_events;
+        """)
+        cur.execute("""
+            CREATE TRIGGER object_event_notify
+                AFTER INSERT ON object_events
+                FOR EACH ROW EXECUTE FUNCTION notify_object_event();
+        """)
+
+        # ── Subscription checkpoints table ───────────────────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS subscription_checkpoints (
+                subscriber_id   TEXT PRIMARY KEY,
+                last_tx_time    TIMESTAMPTZ NOT NULL,
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+        cur.execute(f"GRANT SELECT, INSERT, UPDATE ON subscription_checkpoints TO {GROUP_ROLE};")
+
 
 def provision_user(admin_conn, username, password):
     """

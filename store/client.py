@@ -15,6 +15,7 @@ import psycopg2.extras
 
 from store.base import Storable, _JSONEncoder, _json_decoder_hook
 from store.state_machine import InvalidTransition, GuardFailure, TransitionNotPermitted
+from store.subscriptions import ChangeEvent
 
 
 class VersionConflict(Exception):
@@ -62,8 +63,10 @@ class StoreClient:
         client.close()
     """
 
-    def __init__(self, user, password, host="localhost", port=5432, dbname="postgres"):
+    def __init__(self, user, password, host="localhost", port=5432, dbname="postgres",
+                 event_bus=None):
         self.user = user
+        self.event_bus = event_bus
         self.conn = psycopg2.connect(
             host=host,
             port=port,
@@ -108,6 +111,7 @@ class StoreClient:
             obj._store_valid_to = None
             obj._store_state = row[6]
             obj._store_event_type = "CREATED"
+            self._emit_event(obj)
             return obj._store_entity_id
 
     def update(self, obj, valid_from=None):
@@ -178,6 +182,7 @@ class StoreClient:
             obj._store_tx_time = row[1]
             obj._store_valid_from = row[2]
             obj._store_event_type = event_type
+            self._emit_event(obj)
 
     def delete(self, obj):
         """
@@ -225,6 +230,7 @@ class StoreClient:
             obj._store_version = next_ver
             obj._store_tx_time = row[1]
             obj._store_event_type = "DELETED"
+            self._emit_event(obj)
             return row[0] is not None
 
     def transition(self, obj, new_state, valid_from=None):
@@ -304,6 +310,7 @@ class StoreClient:
         if t.action is not None:
             t.action(obj, current_state, new_state)
         sm.fire_on_enter(new_state, obj, current_state, new_state)
+        self._emit_event(obj)
 
     def write_many(self, objects, valid_from=None):
         """
@@ -554,6 +561,21 @@ class StoreClient:
             return [row[0] for row in cur.fetchall()]
 
     # ── Internal helpers ──────────────────────────────────────────────
+
+    def _emit_event(self, obj):
+        """Emit a ChangeEvent to the event bus (if wired)."""
+        if self.event_bus is None:
+            return
+        event = ChangeEvent(
+            entity_id=obj._store_entity_id,
+            version=obj._store_version,
+            event_type=obj._store_event_type,
+            type_name=obj.type_name(),
+            updated_by=self.user,
+            state=obj._store_state,
+            tx_time=obj._store_tx_time,
+        )
+        self.event_bus.emit(event)
 
     def _next_version(self, entity_id):
         """Get the next version number for an entity."""

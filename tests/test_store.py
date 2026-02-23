@@ -27,6 +27,7 @@ from store.client import StoreClient
 from store.state_machine import StateMachine, Transition, InvalidTransition, GuardFailure, TransitionNotPermitted
 from store.client import VersionConflict, QueryResult
 from store.permissions import share_read, share_write, unshare_read, unshare_write, list_shared_with
+from store.subscriptions import EventBus, ChangeEvent, SubscriptionListener
 
 
 # ── Test models ──────────────────────────────────────────────────────────────
@@ -1248,3 +1249,339 @@ class TestContextManager:
             w = Widget(name="ctx_test", color="x", weight=1.0)
             c.write(w)
             assert w._store_entity_id is not None
+
+
+# ── EventBus (Tier 1: in-process) ──────────────────────────────────────────
+
+class TestEventBus:
+    def test_on_type_fires_for_matching_type(self):
+        bus = EventBus()
+        events = []
+        bus.on("Widget", lambda e: events.append(e))
+        bus.emit(ChangeEvent(
+            entity_id="123", version=1, event_type="CREATED",
+            type_name="Widget", updated_by="alice", state=None,
+            tx_time=datetime.now(timezone.utc),
+        ))
+        assert len(events) == 1
+        assert events[0].type_name == "Widget"
+
+    def test_on_type_ignores_other_types(self):
+        bus = EventBus()
+        events = []
+        bus.on("Widget", lambda e: events.append(e))
+        bus.emit(ChangeEvent(
+            entity_id="123", version=1, event_type="CREATED",
+            type_name="Order", updated_by="alice", state=None,
+            tx_time=datetime.now(timezone.utc),
+        ))
+        assert len(events) == 0
+
+    def test_on_entity_fires_for_matching_entity(self):
+        bus = EventBus()
+        events = []
+        bus.on_entity("abc-123", lambda e: events.append(e))
+        bus.emit(ChangeEvent(
+            entity_id="abc-123", version=1, event_type="UPDATED",
+            type_name="Widget", updated_by="alice", state=None,
+            tx_time=datetime.now(timezone.utc),
+        ))
+        assert len(events) == 1
+
+    def test_on_all_catches_everything(self):
+        bus = EventBus()
+        events = []
+        bus.on_all(lambda e: events.append(e))
+        bus.emit(ChangeEvent(
+            entity_id="x", version=1, event_type="CREATED",
+            type_name="Widget", updated_by="a", state=None,
+            tx_time=datetime.now(timezone.utc),
+        ))
+        bus.emit(ChangeEvent(
+            entity_id="y", version=1, event_type="CREATED",
+            type_name="Order", updated_by="b", state=None,
+            tx_time=datetime.now(timezone.utc),
+        ))
+        assert len(events) == 2
+
+    def test_off_unsubscribes(self):
+        bus = EventBus()
+        events = []
+        cb = lambda e: events.append(e)
+        bus.on("Widget", cb)
+        bus.off("Widget", cb)
+        bus.emit(ChangeEvent(
+            entity_id="x", version=1, event_type="CREATED",
+            type_name="Widget", updated_by="a", state=None,
+            tx_time=datetime.now(timezone.utc),
+        ))
+        assert len(events) == 0
+
+    def test_bad_callback_does_not_break_chain(self):
+        bus = EventBus()
+        events = []
+        bus.on_all(lambda e: 1 / 0)  # will raise
+        bus.on_all(lambda e: events.append(e))
+        bus.emit(ChangeEvent(
+            entity_id="x", version=1, event_type="CREATED",
+            type_name="Widget", updated_by="a", state=None,
+            tx_time=datetime.now(timezone.utc),
+        ))
+        assert len(events) == 1
+
+
+# ── StoreClient + EventBus integration ──────────────────────────────────────
+
+class TestClientEventBus:
+    def test_write_emits_event(self, conn_info, _provision_users):
+        bus = EventBus()
+        events = []
+        bus.on(Widget.type_name(), lambda e: events.append(e))
+        c = StoreClient(
+            user="alice", password="alice_pw",
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"], event_bus=bus,
+        )
+        w = Widget(name="bus_write", color="x", weight=1.0)
+        c.write(w)
+        assert len(events) == 1
+        assert events[0].event_type == "CREATED"
+        assert events[0].entity_id == w._store_entity_id
+        c.close()
+
+    def test_update_emits_event(self, conn_info, _provision_users):
+        bus = EventBus()
+        events = []
+        bus.on_all(lambda e: events.append(e))
+        c = StoreClient(
+            user="alice", password="alice_pw",
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"], event_bus=bus,
+        )
+        w = Widget(name="bus_update", color="v1", weight=1.0)
+        c.write(w)
+        w.color = "v2"
+        c.update(w)
+        assert len(events) == 2
+        assert events[1].event_type == "UPDATED"
+        assert events[1].version == 2
+        c.close()
+
+    def test_delete_emits_event(self, conn_info, _provision_users):
+        bus = EventBus()
+        events = []
+        bus.on_all(lambda e: events.append(e))
+        c = StoreClient(
+            user="alice", password="alice_pw",
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"], event_bus=bus,
+        )
+        w = Widget(name="bus_delete", color="x", weight=1.0)
+        c.write(w)
+        c.delete(w)
+        assert events[-1].event_type == "DELETED"
+        c.close()
+
+    def test_transition_emits_event(self, conn_info, _provision_users):
+        bus = EventBus()
+        events = []
+        bus.on(Order.type_name(), lambda e: events.append(e))
+        c = StoreClient(
+            user="alice", password="alice_pw",
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"], event_bus=bus,
+        )
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        c.write(o)
+        c.transition(o, "FILLED")
+        assert len(events) == 2
+        assert events[1].event_type == "STATE_CHANGE"
+        assert events[1].state == "FILLED"
+        c.close()
+
+    def test_no_bus_is_fine(self, alice):
+        """StoreClient without event_bus still works."""
+        w = Widget(name="no_bus", color="x", weight=1.0)
+        alice.write(w)
+        assert w._store_entity_id is not None
+
+    def test_on_entity_filters_correctly(self, conn_info, _provision_users):
+        bus = EventBus()
+        events = []
+        c = StoreClient(
+            user="alice", password="alice_pw",
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"], event_bus=bus,
+        )
+        w1 = Widget(name="bus_e1", color="x", weight=1.0)
+        c.write(w1)
+        bus.on_entity(w1._store_entity_id, lambda e: events.append(e))
+        w2 = Widget(name="bus_e2", color="x", weight=1.0)
+        c.write(w2)  # should NOT trigger
+        w1.color = "updated"
+        c.update(w1)  # should trigger
+        assert len(events) == 1
+        assert events[0].entity_id == w1._store_entity_id
+        c.close()
+
+
+# ── SubscriptionListener (Tier 2: LISTEN/NOTIFY) ───────────────────────────
+
+class TestSubscriptionListener:
+    def test_listener_receives_notify(self, conn_info, _provision_users):
+        """Listener gets real-time NOTIFY from a different client's write."""
+        bus = EventBus()
+        events = []
+        bus.on_all(lambda e: events.append(e))
+
+        listener = SubscriptionListener(
+            event_bus=bus,
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"],
+            user="alice", password="alice_pw",
+        )
+        listener.start()
+        time.sleep(0.2)
+
+        # Write from a separate client (no bus wired — purely DB trigger)
+        writer = StoreClient(
+            user="alice", password="alice_pw",
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"],
+        )
+        w = Widget(name="notify_test", color="x", weight=1.0)
+        writer.write(w)
+        writer.close()
+
+        time.sleep(0.5)  # Give listener time to receive
+        listener.stop()
+
+        assert any(e.entity_id == w._store_entity_id for e in events)
+
+    def test_listener_catches_up_on_start(self, conn_info, _provision_users):
+        """Listener catches up on events that happened before it started."""
+        # Write an event BEFORE the listener starts
+        writer = StoreClient(
+            user="alice", password="alice_pw",
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"],
+        )
+        w = Widget(name="catchup_test", color="x", weight=1.0)
+        writer.write(w)
+        before_time = w._store_tx_time
+        writer.close()
+
+        # Now start a listener with a checkpoint BEFORE that event
+        bus = EventBus()
+        events = []
+        bus.on_all(lambda e: events.append(e))
+
+        listener = SubscriptionListener(
+            event_bus=bus,
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"],
+            user="alice", password="alice_pw",
+        )
+        # Manually set last_tx_time to before the write
+        listener._conn = psycopg2.connect(
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"], user="alice", password="alice_pw",
+        )
+        listener._conn.autocommit = True
+        from datetime import timedelta
+        listener._last_tx_time = before_time - timedelta(seconds=1)
+        listener._catch_up()
+        listener._conn.close()
+
+        assert any(e.entity_id == w._store_entity_id for e in events)
+
+    def test_durable_checkpoint_persists(self, conn_info, _provision_users):
+        """Subscriber with subscriber_id persists checkpoint to DB."""
+        bus = EventBus()
+        listener = SubscriptionListener(
+            event_bus=bus,
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"],
+            user="alice", password="alice_pw",
+            subscriber_id="test_durable_sub",
+        )
+        listener.start()
+        time.sleep(0.2)
+
+        # Write something so checkpoint advances
+        writer = StoreClient(
+            user="alice", password="alice_pw",
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"],
+        )
+        w = Widget(name="durable_test", color="x", weight=1.0)
+        writer.write(w)
+        writer.close()
+        time.sleep(0.5)
+        listener.stop()
+
+        # Check that checkpoint was saved to DB
+        check_conn = psycopg2.connect(
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"], user="alice", password="alice_pw",
+        )
+        check_conn.autocommit = True
+        with check_conn.cursor() as cur:
+            cur.execute(
+                "SELECT last_tx_time FROM subscription_checkpoints WHERE subscriber_id = %s",
+                ("test_durable_sub",),
+            )
+            row = cur.fetchone()
+            assert row is not None
+            assert row[0] is not None
+        check_conn.close()
+
+    def test_durable_checkpoint_recovers(self, conn_info, _provision_users):
+        """Subscriber recovers checkpoint on restart."""
+        sub_id = "test_recovery_sub"
+
+        # First listener: start, process an event, stop
+        bus1 = EventBus()
+        listener1 = SubscriptionListener(
+            event_bus=bus1,
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"],
+            user="alice", password="alice_pw",
+            subscriber_id=sub_id,
+        )
+        listener1.start()
+        time.sleep(0.2)
+
+        writer = StoreClient(
+            user="alice", password="alice_pw",
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"],
+        )
+        w1 = Widget(name="recovery_1", color="x", weight=1.0)
+        writer.write(w1)
+        time.sleep(0.5)
+        listener1.stop()
+
+        # Write another event while listener is DOWN
+        w2 = Widget(name="recovery_2", color="y", weight=2.0)
+        writer.write(w2)
+        writer.close()
+
+        # Second listener: should catch up and get w2
+        bus2 = EventBus()
+        events2 = []
+        bus2.on_all(lambda e: events2.append(e))
+
+        listener2 = SubscriptionListener(
+            event_bus=bus2,
+            host=conn_info["host"], port=conn_info["port"],
+            dbname=conn_info["dbname"],
+            user="alice", password="alice_pw",
+            subscriber_id=sub_id,
+        )
+        listener2.start()
+        time.sleep(0.3)
+        listener2.stop()
+
+        # Should have caught up on w2
+        assert any(e.entity_id == w2._store_entity_id for e in events2)

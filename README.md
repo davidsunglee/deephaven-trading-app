@@ -115,6 +115,37 @@ print(pnl.to_pure("$pos"))
 # (($pos.current_price - $pos.avg_cost) * $pos.quantity)
 ```
 
+## Event Subscriptions
+
+Two-tier notification system — zero external infrastructure:
+
+```python
+from store.subscriptions import EventBus, SubscriptionListener
+
+# Tier 1: In-process EventBus — synchronous callbacks after DB writes
+bus = EventBus()
+bus.on("Order", lambda e: print(f"{e.event_type} on {e.entity_id}"))
+bus.on_entity(entity_id, lambda e: recalc_risk(e))
+bus.on_all(lambda e: audit_log(e))
+
+client = StoreClient(user="alice", ..., event_bus=bus)
+client.write(order)            # → bus fires ChangeEvent(event_type="CREATED")
+client.transition(order, "FILLED")  # → bus fires ChangeEvent(event_type="STATE_CHANGE")
+
+# Tier 2: Cross-process LISTEN/NOTIFY — real-time PG notifications
+listener = SubscriptionListener(
+    event_bus=bus,
+    host=host, port=port, dbname=dbname,
+    user="bob", password="bob_pw",
+    subscriber_id="risk_engine",       # optional: persists checkpoint for crash recovery
+)
+listener.start()   # background thread: LISTEN + catch-up from checkpoint
+# ... any client on any connection that writes triggers notification ...
+listener.stop()
+```
+
+**Durable catch-up**: if the listener is down when events happen, it replays missed events from the append-only log on reconnect. With `subscriber_id`, the checkpoint persists to DB — survives crashes.
+
 ## Bi-Temporal Event Sourcing
 
 The object store is **append-only** — every write, update, or state change creates an immutable event. Nothing is ever overwritten or deleted.
@@ -377,13 +408,14 @@ windsurf-project/
 │   ├── client.py           # StoreClient (event-sourced, bi-temporal)
 │   ├── schema.py           # DDL: object_events table + RLS policies
 │   ├── state_machine.py    # Declarative StateMachine + InvalidTransition
-│   └── permissions.py      # Share/unshare entities between users
+│   ├── permissions.py      # Share/unshare entities between users
+│   └── subscriptions.py    # EventBus + SubscriptionListener + checkpoints
 ├── reactive/
 │   ├── expr.py             # Expression tree (eval/to_sql/to_pure)
 │   ├── graph.py            # ReactiveGraph (Signal/Computed/Effect/Groups)
 │   └── bridge.py           # Auto-persist effect factory
 ├── tests/
-│   ├── test_store.py       # Bi-temporal + state machine + RLS tests (111)
+│   ├── test_store.py       # Bi-temporal + state machine + RLS + subs tests (127)
 │   ├── test_reactive.py    # Expression + graph + cross-entity tests (137)
 │   └── test_reactive_finance.py  # Finance domain tests (49)
 ├── requirements-server.txt
