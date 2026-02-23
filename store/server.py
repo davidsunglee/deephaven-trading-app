@@ -100,6 +100,15 @@ class ObjectStoreServer:
 
             # Admin needs ADMIN option on group role to grant it to new users
             cur.execute(f"GRANT {GROUP_ROLE} TO {ADMIN_ROLE} WITH ADMIN OPTION;")
+
+            # Allow admin to create schemas (needed by workflow engine)
+            cur.execute(
+                f"GRANT CREATE ON DATABASE {self.conn_info()['dbname']} "
+                f"TO {ADMIN_ROLE};"
+            )
+
+            # Pre-install uuid-ossp extension (pure-SQL shim on pgserver)
+            cur.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
         conn.close()
 
         # Bootstrap schema as admin
@@ -157,6 +166,18 @@ class ObjectStoreServer:
             "port": port,
             "dbname": dbname,
         }
+
+    def dbos_url(self):
+        """Return a SQLAlchemy connection string for the workflow engine.
+
+        Uses psycopg3 driver and Unix socket path compatible with DBOS.
+        """
+        info = self.conn_info()
+        host_encoded = urllib.parse.quote(info["host"], safe="")
+        return (
+            f"postgresql+psycopg://{ADMIN_ROLE}:{self.admin_password}@"
+            f":{info['port']}/{info['dbname']}?host={host_encoded}"
+        )
 
     def stop(self):
         """Stop the embedded PostgreSQL server."""

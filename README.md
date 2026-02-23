@@ -146,6 +146,64 @@ listener.stop()
 
 **Durable catch-up**: if the listener is down when events happen, it replays missed events from the append-only log on reconnect. With `subscriber_id`, the checkpoint persists to DB — survives crashes.
 
+## Workflow Orchestration
+
+Durable multi-step workflows with a **backend-swappable engine** — currently backed by DBOS Transact (PostgreSQL-only, zero extra infrastructure). Users never import DBOS directly.
+
+```python
+from workflow import WorkflowEngine
+
+engine: WorkflowEngine = ...  # injected, backend is opaque
+
+# Plain functions — no decorators, no backend imports
+def create_order(symbol, qty, price, side):
+    order = Order(symbol=symbol, quantity=qty, price=price, side=side)
+    client.write(order)
+    return order._store_entity_id
+
+def fill_order(entity_id):
+    order = client.read(Order, entity_id)
+    client.transition(order, "FILLED")
+
+# Compose into a durable workflow — survives crashes
+def order_to_trade(symbol, qty, price, side):
+    oid = engine.step(create_order, symbol, qty, price, side)
+    engine.step(fill_order, oid)
+    trade = Trade(symbol=symbol, quantity=qty, price=price, side=side)
+    engine.step(client.write, trade)
+
+result = engine.run(order_to_trade, "AAPL", 100, 150.0, "BUY")
+
+# Async with handle
+handle = engine.workflow(noop_workflow)
+handle.get_status()   # PENDING | RUNNING | SUCCESS | ERROR
+handle.get_result()   # blocks until done
+
+# Durable queues with concurrency control
+handle = engine.queue("settlements", settle_trade, trade_id)
+
+# Inter-workflow notifications
+engine.send(workflow_id, "confirmed", {"status": "ok"})
+msg = engine.recv("confirmed", timeout=86400)  # durable wait
+
+# Durable sleep — survives restarts
+engine.sleep(3600)
+```
+
+### WorkflowEngine Interface
+
+| Method | Description |
+|--------|------------|
+| `engine.workflow(fn, *args)` | Run as durable workflow (async, serializable args only) |
+| `engine.run(fn, *args)` | Run as durable workflow (sync, any args) |
+| `engine.step(fn, *args)` | Checkpointed step inside a workflow |
+| `engine.queue(name, fn, *args)` | Enqueue for background execution |
+| `engine.sleep(seconds)` | Durable sleep — survives restarts |
+| `engine.send(wf_id, topic, value)` | Send notification to a workflow |
+| `engine.recv(topic, timeout)` | Wait for notification inside a workflow |
+
+Backend is swappable — implement `WorkflowEngine` for Temporal, AWS Step Functions, or custom.
+
 ## Bi-Temporal Event Sourcing
 
 The object store is **append-only** — every write, update, or state change creates an immutable event. Nothing is ever overwritten or deleted.
@@ -414,13 +472,17 @@ windsurf-project/
 │   ├── expr.py             # Expression tree (eval/to_sql/to_pure)
 │   ├── graph.py            # ReactiveGraph (Signal/Computed/Effect/Groups)
 │   └── bridge.py           # Auto-persist effect factory
+├── workflow/
+│   ├── engine.py           # WorkflowEngine ABC + WorkflowHandle
+│   └── dbos_engine.py      # DBOS-backed implementation (hidden)
 ├── tests/
 │   ├── test_store.py       # Bi-temporal + state machine + RLS + subs tests (127)
 │   ├── test_reactive.py    # Expression + graph + cross-entity tests (137)
-│   └── test_reactive_finance.py  # Finance domain tests (49)
+│   ├── test_reactive_finance.py  # Finance domain tests (49)
+│   └── test_workflow.py    # Workflow engine tests (16)
 ├── requirements-server.txt
 ├── requirements-client.txt
-├── requirements-store.txt  # reaktiv, psycopg2-binary, pgserver
+├── requirements-store.txt  # reaktiv, psycopg2-binary, pgserver, dbos
 └── README.md
 ```
 

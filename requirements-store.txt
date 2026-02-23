@@ -1,4 +1,5 @@
-# Object Store + Reactive Layer dependencies
+# Object Store + Reactive Layer + Workflow dependencies
 reaktiv>=1.0.0
 psycopg2-binary>=2.9.0
 pgserver>=0.1.0
+dbos>=2.13.0
