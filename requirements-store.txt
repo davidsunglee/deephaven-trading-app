@@ -1,0 +1,4 @@
+# Object Store + Reactive Layer dependencies
+reaktiv>=1.0.0
+psycopg2-binary>=2.9.0
+pgserver>=0.1.0

@@ -1,6 +1,6 @@
 # Deephaven Real-Time Trading Platform
 
-A **server/client** real-time trading platform built on [Deephaven.io](https://deephaven.io). The server acts as a shared data engine (run by infra/platform team) while multiple Python clients (quants, risk analysts, PMs) connect remotely to configure their own ticking views.
+A **server/client** real-time trading platform built on [Deephaven.io](https://deephaven.io), with a **reactive object store** backed by embedded PostgreSQL and a **domain-agnostic expression language** that compiles to Python, SQL, and Legend Pure.
 
 ## Architecture
 
@@ -20,15 +20,30 @@ A **server/client** real-time trading platform built on [Deephaven.io](https://d
      │  Quant   │ │   Risk   │   │     PM     │
      │  Client  │ │  Client  │   │   Client   │
      └──────────┘ └──────────┘   └────────────┘
+
+┌──────────────────────────────────────────────────────┐
+│  OBJECT STORE  (store/)                              │
+│  • Embedded PostgreSQL with Row-Level Security       │
+│  • Zero-trust: one role per user, RLS-enforced       │
+│  • Any @dataclass Storable → JSONB persistence       │
+└───────────────────────┬──────────────────────────────┘
+                        │
+┌───────────────────────▼──────────────────────────────┐
+│  REACTIVE LAYER  (reactive/)                         │
+│  • Expression tree: eval() → Python, to_sql() → PG, │
+│    to_pure() → Legend Pure                           │
+│  • ReactiveGraph: field Signals → Computed → Effects │
+│  • Auto-persist bridge to object store               │
+└──────────────────────────────────────────────────────┘
 ```
 
 ## Quick Start
 
 ### Prerequisites
 - **Python 3.10+**
-- **Java 11-21** (set `JAVA_HOME`)
+- **Java 11-21** (set `JAVA_HOME`) — only for Deephaven server
 
-### 1. Start the Server
+### 1. Start the Deephaven Server
 
 ```bash
 pip install -r requirements-server.txt
@@ -54,6 +69,95 @@ python3 pm_client.py             # P&L snapshots, position sizing
 
 Clients connect via `pydeephaven` (lightweight — **no Java needed** on client machines). Tables created by clients are visible in the Web IDE.
 
+### 3. Object Store + Reactive Layer
+
+```bash
+pip install -r requirements-store.txt
+```
+
+```python
+from dataclasses import dataclass
+from store.base import Storable
+from reactive import Field, Const, If, Func, ReactiveGraph
+
+# Define any domain object
+@dataclass
+class Position(Storable):
+    symbol: str = ""
+    quantity: int = 0
+    avg_cost: float = 0.0
+    current_price: float = 0.0
+
+# Build reactive computations
+graph = ReactiveGraph()
+pos = Position(symbol="AAPL", quantity=100, avg_cost=220.0, current_price=230.0)
+node_id = graph.track(pos)
+
+# Expression tree — never computes at definition time
+pnl = (Field("current_price") - Field("avg_cost")) * Field("quantity")
+graph.computed(node_id, "pnl", pnl)
+
+print(graph.get(node_id, "pnl"))        # 1000.0
+
+# React to market data updates
+graph.update(node_id, "current_price", 235.0)
+print(graph.get(node_id, "pnl"))        # 1500.0
+
+# Same expression compiles to SQL and Legend Pure
+print(pnl.to_sql("data"))
+# ((data->>'current_price')::float - (data->>'avg_cost')::float) * (data->>'quantity')::float
+
+print(pnl.to_pure("$pos"))
+# (($pos.current_price - $pos.avg_cost) * $pos.quantity)
+```
+
+## Reactive Expression Language
+
+A typed expression tree that builds at definition time and compiles to three targets:
+
+| Target | Method | Use case |
+|--------|--------|----------|
+| **Python** | `expr.eval(ctx)` | Powers reaktiv Computed values |
+| **PostgreSQL** | `expr.to_sql(col)` | JSONB push-down queries |
+| **Legend Pure** | `expr.to_pure(var)` | FINOS Legend Engine integration |
+
+### Supported Operations
+
+| Category | Operations |
+|----------|-----------|
+| **Arithmetic** | `+`, `-`, `*`, `/`, `%`, `**`, negation, abs |
+| **Comparison** | `>`, `<`, `>=`, `<=`, `==`, `!=` |
+| **Logical** | `&` (AND), `\|` (OR), `~` (NOT) |
+| **Conditionals** | `If(cond, then, else)` → `CASE WHEN` in SQL |
+| **Null handling** | `Coalesce([...])`, `IsNull(expr)`, `.is_null()` |
+| **Functions** | `sqrt`, `ceil`, `floor`, `round`, `log`, `exp`, `min`, `max` |
+| **String** | `.length()`, `.upper()`, `.lower()`, `.contains()`, `.starts_with()`, `.concat()` |
+
+Expressions are fully serializable via `to_json()` / `from_json()` for persistence and inspection.
+
+### Example: Risk Alert
+
+```python
+from reactive import Field, Const, If, Func
+
+# Stop-loss: alert if unrealized loss exceeds threshold
+pnl = (Field("current_price") - Field("avg_cost")) * Field("quantity")
+alert = If(pnl < Const(-5000), Const("STOP_LOSS"), Const("OK"))
+
+# Nested conditionals
+confidence = If(
+    Field("strength") > Const(0.75), Const("HIGH"),
+    If(Field("strength") > Const(0.5), Const("MEDIUM"), Const("LOW")),
+)
+
+# Option intrinsic value
+intrinsic = If(
+    Field("underlying_price") > Field("strike"),
+    Field("underlying_price") - Field("strike"),
+    Const(0),
+)
+```
+
 ## Project Structure
 
 ```
@@ -68,8 +172,23 @@ windsurf-project/
 │   ├── quant_client.py     # Quant: filtered views, derived tables
 │   ├── risk_client.py      # Risk: exposure monitoring, alerts
 │   └── pm_client.py        # PM: portfolio summary, P&L snapshots
+├── store/
+│   ├── base.py             # Storable base class + JSON serialization
+│   ├── models.py           # Domain models: Trade, Order, Signal
+│   ├── server.py           # Embedded PG server bootstrap
+│   ├── client.py           # StoreClient (RLS-enforced CRUD)
+│   └── schema.py           # DDL + RLS policies
+├── reactive/
+│   ├── expr.py             # Expression tree (eval/to_sql/to_pure)
+│   ├── graph.py            # ReactiveGraph (Signal/Computed/Effect)
+│   └── bridge.py           # Auto-persist effect factory
+├── tests/
+│   ├── test_store.py       # Object store + RLS tests
+│   ├── test_reactive.py    # Generic expression + graph tests (118)
+│   └── test_reactive_finance.py  # Finance domain tests (49)
 ├── requirements-server.txt
 ├── requirements-client.txt
+├── requirements-store.txt  # reaktiv, psycopg2-binary, pgserver
 └── README.md
 ```
 
