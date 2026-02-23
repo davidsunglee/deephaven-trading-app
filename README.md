@@ -25,7 +25,10 @@ A **server/client** real-time trading platform built on [Deephaven.io](https://d
 │  OBJECT STORE  (store/)                              │
 │  • Embedded PostgreSQL with Row-Level Security       │
 │  • Zero-trust: one role per user, RLS-enforced       │
-│  • Any @dataclass Storable → JSONB persistence       │
+│  • Bi-temporal event sourcing (tx_time + valid_time) │
+│  • Append-only: never overwrite, full audit trail    │
+│  • Declarative state machines for lifecycle mgmt     │
+│  • owner + updated_by on every event for audit       │
 └───────────────────────┬──────────────────────────────┘
                         │
 ┌───────────────────────▼──────────────────────────────┐
@@ -78,6 +81,7 @@ pip install -r requirements-store.txt
 ```python
 from dataclasses import dataclass
 from store.base import Storable
+from store.state_machine import StateMachine
 from reactive import Field, Const, If, Func, ReactiveGraph
 
 # Define any domain object
@@ -109,6 +113,92 @@ print(pnl.to_sql("data"))
 
 print(pnl.to_pure("$pos"))
 # (($pos.current_price - $pos.avg_cost) * $pos.quantity)
+```
+
+## Bi-Temporal Event Sourcing
+
+The object store is **append-only** — every write, update, or state change creates an immutable event. Nothing is ever overwritten or deleted.
+
+Every event carries two time dimensions:
+
+| Column | Meaning | Who sets it |
+|--------|---------|-------------|
+| `tx_time` | When we recorded this fact | System (`now()`, immutable) |
+| `valid_from` | When this fact becomes effective | User (defaults to `now()`) |
+| `owner` | Entity owner (controls RLS visibility) | System (from first write) |
+| `updated_by` | Who made this specific change | System (`current_user`) |
+
+### Four Query Modes
+
+```python
+# Current state (default)
+trade = client.read(Trade, entity_id)
+
+# Full history — every version, including tombstones
+versions = client.history(Trade, entity_id)
+
+# As-of transaction time: "what did we know at noon?"
+old = client.as_of(Trade, entity_id, tx_time=noon)
+
+# As-of valid time: "what was effective at 10am?"
+eff = client.as_of(Trade, entity_id, valid_time=ten_am)
+
+# Full bi-temporal: "what did we know at noon about 10am?"
+snap = client.as_of(Trade, entity_id, tx_time=noon, valid_time=ten_am)
+```
+
+### Backdated Corrections
+
+```python
+# Discover at 3pm that a 10am trade had wrong price
+trade.price = 151.25
+client.update(trade, valid_from=datetime(2026, 2, 22, 10, 0, tzinfo=timezone.utc))
+# event_type automatically set to "CORRECTED"
+```
+
+### Event Types
+
+| Type | Meaning |
+|------|--------|
+| `CREATED` | Entity first written |
+| `UPDATED` | Data changed |
+| `DELETED` | Soft-delete tombstone |
+| `STATE_CHANGE` | Lifecycle state transition |
+| `CORRECTED` | Backdated correction (`valid_from` in the past) |
+
+## State Machines
+
+Declarative lifecycle management for any Storable:
+
+```python
+from store.state_machine import StateMachine
+
+class OrderLifecycle(StateMachine):
+    initial = "PENDING"
+    transitions = {
+        "PENDING":   ["PARTIAL", "FILLED", "CANCELLED"],
+        "PARTIAL":   ["FILLED", "CANCELLED"],
+        "FILLED":    ["SETTLED"],
+    }
+
+@dataclass
+class Order(Storable):
+    symbol: str = ""
+    quantity: int = 0
+    price: float = 0.0
+    side: str = ""
+
+Order._state_machine = OrderLifecycle
+
+# Usage
+client.write(order)                    # state = "PENDING"
+client.transition(order, "FILLED")     # state = "FILLED"
+client.transition(order, "SETTLED")    # state = "SETTLED"
+client.transition(order, "PENDING")    # raises InvalidTransition
+
+# Full state history
+for version in client.history(Order, order._store_entity_id):
+    print(f"v{version._store_version}: {version._store_state} by {version._store_updated_by}")
 ```
 
 ## Reactive Expression Language
@@ -173,17 +263,19 @@ windsurf-project/
 │   ├── risk_client.py      # Risk: exposure monitoring, alerts
 │   └── pm_client.py        # PM: portfolio summary, P&L snapshots
 ├── store/
-│   ├── base.py             # Storable base class + JSON serialization
+│   ├── base.py             # Storable base class + bi-temporal metadata
 │   ├── models.py           # Domain models: Trade, Order, Signal
 │   ├── server.py           # Embedded PG server bootstrap
-│   ├── client.py           # StoreClient (RLS-enforced CRUD)
-│   └── schema.py           # DDL + RLS policies
+│   ├── client.py           # StoreClient (event-sourced, bi-temporal)
+│   ├── schema.py           # DDL: object_events table + RLS policies
+│   ├── state_machine.py    # Declarative StateMachine + InvalidTransition
+│   └── permissions.py      # Share/unshare entities between users
 ├── reactive/
 │   ├── expr.py             # Expression tree (eval/to_sql/to_pure)
 │   ├── graph.py            # ReactiveGraph (Signal/Computed/Effect)
 │   └── bridge.py           # Auto-persist effect factory
 ├── tests/
-│   ├── test_store.py       # Object store + RLS tests
+│   ├── test_store.py       # Bi-temporal + state machine + RLS tests (76)
 │   ├── test_reactive.py    # Generic expression + graph tests (118)
 │   └── test_reactive_finance.py  # Finance domain tests (49)
 ├── requirements-server.txt

@@ -1,6 +1,15 @@
 """
 Storable base class — defines how Python objects serialize to/from JSONB.
 Subclass with @dataclass to create persistable types.
+
+Bi-temporal metadata:
+- entity_id: stable identity across versions
+- version: monotonic per entity
+- tx_time: when this version was recorded (system, immutable)
+- valid_from: when this version is effective (user, defaults to now)
+- valid_to: when this version stops being effective
+- state: lifecycle state (if a state machine is registered)
+- event_type: CREATED, UPDATED, DELETED, STATE_CHANGE, CORRECTED
 """
 
 import json
@@ -46,7 +55,7 @@ def _json_decoder_hook(d):
 
 class Storable:
     """
-    Base class for objects that can be stored in the PostgreSQL object store.
+    Base class for objects stored in the bi-temporal event-sourced object store.
 
     Subclass as a dataclass:
 
@@ -60,13 +69,23 @@ class Storable:
     Then use StoreClient to persist:
 
         client.write(Trade(symbol="AAPL", quantity=100, price=228.0, side="BUY"))
+
+    Every write/update creates an immutable event with bi-temporal timestamps.
     """
 
-    # Set by the store after writing / reading
-    _store_id: Optional[str] = None
+    # Bi-temporal metadata — set by the store after writing / reading
+    _store_entity_id: Optional[str] = None
+    _store_version: Optional[int] = None
     _store_owner: Optional[str] = None
-    _store_created_at: Optional[datetime] = None
-    _store_updated_at: Optional[datetime] = None
+    _store_updated_by: Optional[str] = None
+    _store_tx_time: Optional[datetime] = None
+    _store_valid_from: Optional[datetime] = None
+    _store_valid_to: Optional[datetime] = None
+    _store_state: Optional[str] = None
+    _store_event_type: Optional[str] = None
+
+    # Optional state machine — set on the class by the user
+    _state_machine = None
 
     def to_json(self) -> str:
         """Serialize this object to a JSON string for JSONB storage."""
@@ -75,7 +94,7 @@ class Storable:
         else:
             data = {
                 k: v for k, v in self.__dict__.items()
-                if not k.startswith("_store_")
+                if not k.startswith("_store_") and not k.startswith("_state_")
             }
         return json.dumps(data, cls=_JSONEncoder)
 

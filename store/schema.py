@@ -1,5 +1,6 @@
 """
-Database schema: objects table, indexes, RLS policies, and user provisioning.
+Database schema: object_events table (bi-temporal event sourcing),
+indexes, RLS policies, and user provisioning.
 All DDL runs as app_admin (the table owner).
 """
 
@@ -10,61 +11,79 @@ ADMIN_ROLE = "app_admin"
 
 
 def bootstrap_schema(admin_conn):
-    """Create the objects table, indexes, and RLS policies. Idempotent."""
+    """Create the object_events table, indexes, and RLS policies. Idempotent."""
     admin_conn.autocommit = True
     with admin_conn.cursor() as cur:
-        # ── Table ────────────────────────────────────────────────────
+        # ── Table: append-only bi-temporal event log ─────────────────
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS objects (
-                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            CREATE TABLE IF NOT EXISTS object_events (
+                event_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                entity_id   UUID NOT NULL,
+                version     INT NOT NULL,
                 type_name   TEXT NOT NULL,
                 owner       TEXT NOT NULL DEFAULT current_user,
+                updated_by  TEXT NOT NULL DEFAULT current_user,
                 readers     TEXT[] NOT NULL DEFAULT '{}',
                 writers     TEXT[] NOT NULL DEFAULT '{}',
                 data        JSONB NOT NULL,
-                created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                state       TEXT,
+                event_type  TEXT NOT NULL DEFAULT 'CREATED',
+                event_meta  JSONB,
+                tx_time     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                valid_from  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                valid_to    TIMESTAMPTZ,
+                UNIQUE (entity_id, version)
             );
         """)
 
         # ── Indexes ──────────────────────────────────────────────────
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_objects_type
-                ON objects (type_name);
+            CREATE INDEX IF NOT EXISTS idx_events_entity_version
+                ON object_events (entity_id, version DESC);
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_objects_owner
-                ON objects (owner);
+            CREATE INDEX IF NOT EXISTS idx_events_type
+                ON object_events (type_name);
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_objects_data
-                ON objects USING GIN (data);
+            CREATE INDEX IF NOT EXISTS idx_events_owner
+                ON object_events (owner);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_data
+                ON object_events USING GIN (data);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_tx_time
+                ON object_events (tx_time);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_valid_from
+                ON object_events (valid_from);
         """)
 
         # ── Enable RLS ───────────────────────────────────────────────
-        cur.execute("ALTER TABLE objects ENABLE ROW LEVEL SECURITY;")
-
-        # Force RLS even for the table owner (app_admin uses its own policy)
-        cur.execute("ALTER TABLE objects FORCE ROW LEVEL SECURITY;")
+        cur.execute("ALTER TABLE object_events ENABLE ROW LEVEL SECURITY;")
+        cur.execute("ALTER TABLE object_events FORCE ROW LEVEL SECURITY;")
 
         # ── Drop existing policies (idempotent re-create) ────────────
         for policy in [
-            "admin_all", "user_select", "user_insert", "user_update", "user_delete"
+            "admin_all", "user_select", "user_insert", "user_update"
         ]:
-            cur.execute(f"DROP POLICY IF EXISTS {policy} ON objects;")
+            cur.execute(f"DROP POLICY IF EXISTS {policy} ON object_events;")
 
         # ── Admin policy: full access ────────────────────────────────
         cur.execute(f"""
-            CREATE POLICY admin_all ON objects
+            CREATE POLICY admin_all ON object_events
                 FOR ALL
                 TO {ADMIN_ROLE}
                 USING (true)
                 WITH CHECK (true);
         """)
 
-        # ── User SELECT: owner, or listed in readers, or listed in writers
+        # ── User SELECT: owner, or listed in readers/writers ─────────
         cur.execute(f"""
-            CREATE POLICY user_select ON objects
+            CREATE POLICY user_select ON object_events
                 FOR SELECT
                 TO {GROUP_ROLE}
                 USING (
@@ -74,17 +93,28 @@ def bootstrap_schema(admin_conn):
                 );
         """)
 
-        # ── User INSERT: can only create rows you own ────────────────
+        # ── User INSERT: own events, OR writer appending new versions
+        # updated_by is always current_user (enforced by DEFAULT, unforgeable)
+        # owner stays as original entity owner for RLS visibility
         cur.execute(f"""
-            CREATE POLICY user_insert ON objects
+            CREATE POLICY user_insert ON object_events
                 FOR INSERT
                 TO {GROUP_ROLE}
-                WITH CHECK (owner = current_user);
+                WITH CHECK (
+                    updated_by = current_user
+                    AND (
+                        owner = current_user
+                        OR (
+                            current_user = ANY(writers)
+                            AND version > 1
+                        )
+                    )
+                );
         """)
 
-        # ── User UPDATE: owner or listed in writers ──────────────────
+        # ── User UPDATE: owner or writer (for sharing operations) ────
         cur.execute(f"""
-            CREATE POLICY user_update ON objects
+            CREATE POLICY user_update ON object_events
                 FOR UPDATE
                 TO {GROUP_ROLE}
                 USING (
@@ -97,16 +127,10 @@ def bootstrap_schema(admin_conn):
                 );
         """)
 
-        # ── User DELETE: owner only ──────────────────────────────────
-        cur.execute(f"""
-            CREATE POLICY user_delete ON objects
-                FOR DELETE
-                TO {GROUP_ROLE}
-                USING (owner = current_user);
-        """)
+        # No DELETE policy — append-only, nobody deletes events
 
         # ── Grant table permissions to group role ────────────────────
-        cur.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON objects TO {GROUP_ROLE};")
+        cur.execute(f"GRANT SELECT, INSERT, UPDATE ON object_events TO {GROUP_ROLE};")
 
 
 def provision_user(admin_conn, username, password):
