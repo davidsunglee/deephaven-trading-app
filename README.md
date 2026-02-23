@@ -168,18 +168,28 @@ client.update(trade, valid_from=datetime(2026, 2, 22, 10, 0, tzinfo=timezone.utc
 
 ## State Machines
 
-Declarative lifecycle management for any Storable:
+Declarative lifecycle management with **guards**, **actions**, **hooks**, and **per-transition permissions**:
 
 ```python
-from store.state_machine import StateMachine
+from store.state_machine import StateMachine, Transition
+from reactive.expr import Field, Const
 
 class OrderLifecycle(StateMachine):
     initial = "PENDING"
-    transitions = {
-        "PENDING":   ["PARTIAL", "FILLED", "CANCELLED"],
-        "PARTIAL":   ["FILLED", "CANCELLED"],
-        "FILLED":    ["SETTLED"],
-    }
+    transitions = [
+        Transition("PENDING", "PARTIAL"),
+        Transition("PENDING", "FILLED",
+                   guard=Field("quantity") > Const(0)),       # Expr guard
+        Transition("PENDING", "CANCELLED",
+                   allowed_by=["risk_manager"]),               # Permission
+        Transition("PARTIAL", "FILLED"),
+        Transition("PARTIAL", "CANCELLED"),
+        Transition("FILLED", "SETTLED",
+                   guard=Field("price") > Const(0),
+                   action=lambda obj, f, t: book_settlement(obj)),
+    ]
+    on_enter = {"FILLED": [lambda obj, f, t: notify_risk(obj)]}
+    on_exit  = {"PENDING": [lambda obj, f, t: log_departure(obj)]}
 
 @dataclass
 class Order(Storable):
@@ -189,16 +199,28 @@ class Order(Storable):
     side: str = ""
 
 Order._state_machine = OrderLifecycle
+```
 
-# Usage
+### Guards, Actions, Permissions
+
+| Feature | Description |
+|---------|------------|
+| **Guard** | `Expr` evaluated against object data. Raises `GuardFailure` if False. |
+| **Action** | `callable(obj, from_state, to_state)` fired after transition. |
+| **allowed_by** | List of usernames permitted to trigger. Raises `TransitionNotPermitted`. |
+| **on_enter/on_exit** | Hooks fired when entering/leaving any state. |
+
+Hooks fire in order: `on_exit` → `action` → `on_enter`.
+
+```python
 client.write(order)                    # state = "PENDING"
-client.transition(order, "FILLED")     # state = "FILLED"
-client.transition(order, "SETTLED")    # state = "SETTLED"
+client.transition(order, "FILLED")     # guard passes, on_exit + on_enter fire
+client.transition(order, "SETTLED")    # guard passes, action fires
 client.transition(order, "PENDING")    # raises InvalidTransition
 
-# Full state history
-for version in client.history(Order, order._store_entity_id):
-    print(f"v{version._store_version}: {version._store_state} by {version._store_updated_by}")
+# Full state history with audit trail
+for v in client.history(Order, order._store_entity_id):
+    print(f"v{v._store_version}: {v._store_state} by {v._store_updated_by}")
 ```
 
 ## Reactive Expression Language
@@ -275,7 +297,7 @@ windsurf-project/
 │   ├── graph.py            # ReactiveGraph (Signal/Computed/Effect)
 │   └── bridge.py           # Auto-persist effect factory
 ├── tests/
-│   ├── test_store.py       # Bi-temporal + state machine + RLS tests (76)
+│   ├── test_store.py       # Bi-temporal + state machine + RLS tests (89)
 │   ├── test_reactive.py    # Generic expression + graph tests (118)
 │   └── test_reactive_finance.py  # Finance domain tests (49)
 ├── requirements-server.txt

@@ -24,7 +24,7 @@ from store.server import ObjectStoreServer
 from store.schema import provision_user
 from store.base import Storable, _JSONEncoder, _json_decoder_hook
 from store.client import StoreClient
-from store.state_machine import StateMachine, InvalidTransition
+from store.state_machine import StateMachine, Transition, InvalidTransition, GuardFailure, TransitionNotPermitted
 from store.permissions import share_read, share_write, unshare_read, unshare_write, list_shared_with
 
 
@@ -49,12 +49,45 @@ class RichObject(Storable):
             self.tags = []
 
 
+# Import Expr primitives for guards
+from reactive.expr import Field, Const
+
+
+# Action/hook trackers for testing
+action_log = []
+
+
+def _track_action(obj, from_state, to_state):
+    action_log.append(("action", from_state, to_state))
+
+
+def _track_on_enter(obj, from_state, to_state):
+    action_log.append(("on_enter", to_state))
+
+
+def _track_on_exit(obj, from_state, to_state):
+    action_log.append(("on_exit", from_state))
+
+
 class OrderLifecycle(StateMachine):
     initial = "PENDING"
-    transitions = {
-        "PENDING":   ["PARTIAL", "FILLED", "CANCELLED"],
-        "PARTIAL":   ["FILLED", "CANCELLED"],
-        "FILLED":    ["SETTLED"],
+    transitions = [
+        Transition("PENDING", "PARTIAL"),
+        Transition("PENDING", "FILLED",
+                   guard=Field("quantity") > Const(0)),
+        Transition("PENDING", "CANCELLED",
+                   allowed_by=["risk_manager"]),
+        Transition("PARTIAL", "FILLED"),
+        Transition("PARTIAL", "CANCELLED"),
+        Transition("FILLED", "SETTLED",
+                   guard=Field("price") > Const(0),
+                   action=_track_action),
+    ]
+    on_enter = {
+        "FILLED": [_track_on_enter],
+    }
+    on_exit = {
+        "PENDING": [_track_on_exit],
     }
 
 
@@ -442,12 +475,6 @@ class TestStateMachine:
         event_types = [h._store_event_type for h in history]
         assert event_types == ["CREATED", "STATE_CHANGE", "STATE_CHANGE"]
 
-    def test_cancel_from_pending(self, alice):
-        o = Order(symbol="AMZN", quantity=50, price=225.0, side="BUY")
-        alice.write(o)
-        alice.transition(o, "CANCELLED")
-        assert o._store_state == "CANCELLED"
-
     def test_cancel_from_partial(self, alice):
         o = Order(symbol="NVDA", quantity=100, price=138.0, side="BUY")
         alice.write(o)
@@ -458,6 +485,7 @@ class TestStateMachine:
     def test_cannot_transition_from_terminal_state(self, alice):
         o = Order(symbol="META", quantity=10, price=700.0, side="SELL")
         alice.write(o)
+        alice.transition(o, "PARTIAL")
         alice.transition(o, "CANCELLED")
         with pytest.raises(InvalidTransition):
             alice.transition(o, "PENDING")
@@ -487,6 +515,153 @@ class TestStateMachine:
 
         loaded = alice.read(Order, o._store_entity_id)
         assert loaded._store_state == "FILLED"
+
+    # ── Guard tests ────────────────────────────────────────────────
+
+    def test_guard_allows_transition(self, alice):
+        """PENDING → FILLED has guard: quantity > 0. Passes with quantity=100."""
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "FILLED")
+        assert o._store_state == "FILLED"
+
+    def test_guard_blocks_transition(self, alice):
+        """PENDING → FILLED has guard: quantity > 0. Fails with quantity=0."""
+        o = Order(symbol="AAPL", quantity=0, price=228.0, side="BUY")
+        alice.write(o)
+        with pytest.raises(GuardFailure):
+            alice.transition(o, "FILLED")
+        assert o._store_state == "PENDING"  # unchanged
+
+    def test_guard_on_settled_allows(self, alice):
+        """FILLED → SETTLED has guard: price > 0. Passes with price=228."""
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "FILLED")
+        alice.transition(o, "SETTLED")
+        assert o._store_state == "SETTLED"
+
+    def test_guard_on_settled_blocks(self, alice):
+        """FILLED → SETTLED has guard: price > 0. Fails with price=0."""
+        o = Order(symbol="AAPL", quantity=100, price=0.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "FILLED")
+        with pytest.raises(GuardFailure):
+            alice.transition(o, "SETTLED")
+        assert o._store_state == "FILLED"  # unchanged
+
+    def test_guard_failure_is_distinct_from_invalid(self, alice):
+        """GuardFailure and InvalidTransition are different exceptions."""
+        o = Order(symbol="AAPL", quantity=0, price=228.0, side="BUY")
+        alice.write(o)
+        # GuardFailure: edge exists but guard fails
+        with pytest.raises(GuardFailure):
+            alice.transition(o, "FILLED")
+        # InvalidTransition: edge doesn't exist
+        with pytest.raises(InvalidTransition):
+            alice.transition(o, "SETTLED")
+
+    # ── Permission tests ───────────────────────────────────────────
+
+    def test_allowed_by_blocks_unauthorized_user(self, alice):
+        """PENDING → CANCELLED requires allowed_by=['risk_manager']. Alice is not in the list."""
+        o = Order(symbol="TSLA", quantity=50, price=355.0, side="SELL")
+        alice.write(o)
+        with pytest.raises(TransitionNotPermitted):
+            alice.transition(o, "CANCELLED")
+        assert o._store_state == "PENDING"
+
+    def test_allowed_by_permits_authorized_user(self, conn_info, _provision_users):
+        """User 'risk_manager' can cancel."""
+        from store.schema import provision_user
+        from store.server import ObjectStoreServer
+        # Provision risk_manager user
+        admin_c = StoreClient(
+            user="app_admin", password="test_admin_pw",
+            host=conn_info["host"], port=conn_info["port"], dbname=conn_info["dbname"],
+        )
+        with admin_c.conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'risk_manager'")
+            if cur.fetchone() is None:
+                provision_user(admin_c.conn, "risk_manager", "rm_pw")
+        admin_c.close()
+
+        rm = StoreClient(
+            user="risk_manager", password="rm_pw",
+            host=conn_info["host"], port=conn_info["port"], dbname=conn_info["dbname"],
+        )
+        o = Order(symbol="TSLA", quantity=50, price=355.0, side="SELL")
+        rm.write(o)
+        rm.transition(o, "CANCELLED")
+        assert o._store_state == "CANCELLED"
+        rm.close()
+
+    def test_transition_without_allowed_by_open_to_all(self, alice):
+        """PENDING → PARTIAL has no allowed_by — anyone can trigger."""
+        o = Order(symbol="GOOG", quantity=200, price=192.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "PARTIAL")
+        assert o._store_state == "PARTIAL"
+
+    # ── Action tests ───────────────────────────────────────────────
+
+    def test_action_fires_on_transition(self, alice):
+        """FILLED → SETTLED has an action. Verify it fires."""
+        action_log.clear()
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "FILLED")
+        alice.transition(o, "SETTLED")
+        assert ("action", "FILLED", "SETTLED") in action_log
+
+    def test_action_does_not_fire_on_other_transitions(self, alice):
+        """PENDING → PARTIAL has no action."""
+        action_log.clear()
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "PARTIAL")
+        assert not any(e[0] == "action" for e in action_log)
+
+    # ── Hook tests ─────────────────────────────────────────────────
+
+    def test_on_exit_fires(self, alice):
+        """on_exit['PENDING'] should fire when leaving PENDING."""
+        action_log.clear()
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "PARTIAL")
+        assert ("on_exit", "PENDING") in action_log
+
+    def test_on_enter_fires(self, alice):
+        """on_enter['FILLED'] should fire when entering FILLED."""
+        action_log.clear()
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "FILLED")
+        assert ("on_enter", "FILLED") in action_log
+
+    def test_hook_order_exit_then_action_then_enter(self, alice):
+        """Hooks fire in order: on_exit → action → on_enter."""
+        action_log.clear()
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        alice.write(o)
+        # PENDING → FILLED fires on_exit[PENDING] and on_enter[FILLED]
+        alice.transition(o, "FILLED")
+        # FILLED → SETTLED fires action + no hooks for these states
+        alice.transition(o, "SETTLED")
+        # Check on_exit[PENDING] came before on_enter[FILLED]
+        exit_idx = action_log.index(("on_exit", "PENDING"))
+        enter_idx = action_log.index(("on_enter", "FILLED"))
+        assert exit_idx < enter_idx
+
+    def test_no_hooks_for_unregistered_states(self, alice):
+        """PARTIAL has no on_enter/on_exit hooks."""
+        action_log.clear()
+        o = Order(symbol="AAPL", quantity=100, price=228.0, side="BUY")
+        alice.write(o)
+        alice.transition(o, "PARTIAL")
+        # on_exit[PENDING] fires, but no on_enter[PARTIAL]
+        assert not any(e == ("on_enter", "PARTIAL") for e in action_log)
 
 
 # ── Basic CRUD ───────────────────────────────────────────────────────────────

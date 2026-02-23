@@ -14,7 +14,7 @@ import psycopg2
 import psycopg2.extras
 
 from store.base import Storable, _JSONEncoder, _json_decoder_hook
-from store.state_machine import InvalidTransition
+from store.state_machine import InvalidTransition, GuardFailure, TransitionNotPermitted
 
 
 class StoreClient:
@@ -183,7 +183,8 @@ class StoreClient:
     def transition(self, obj, new_state, valid_from=None):
         """
         Transition an entity to a new lifecycle state.
-        Validates against the registered state machine.
+        Validates against the registered state machine (guards, permissions).
+        Fires on_exit → action → on_enter hooks.
         Creates a STATE_CHANGE event.
         """
         if obj._state_machine is None:
@@ -192,16 +193,31 @@ class StoreClient:
             )
 
         current_state = obj._store_state
-        obj._state_machine.validate_transition(current_state, new_state)
+        sm = obj._state_machine
+
+        # Build context from object data for guard evaluation
+        context = json.loads(obj.to_json())
+
+        # Validate: checks edge exists, guard passes, user is permitted
+        t = sm.validate_transition(
+            current_state, new_state, context=context, user=self.user
+        )
 
         next_ver = self._next_version(obj._store_entity_id)
         json_data = obj.to_json()
         type_name = obj.type_name()
 
-        event_meta = json.dumps({
+        # Richer event_meta for audit
+        meta = {
             "from_state": current_state,
             "to_state": new_state,
-        })
+            "triggered_by": self.user,
+        }
+        if t.guard is not None:
+            meta["guard"] = str(t.guard)
+        if t.allowed_by is not None:
+            meta["allowed_by"] = t.allowed_by
+        event_meta = json.dumps(meta)
 
         with self.conn.cursor() as cur:
             # Copy owner, readers/writers from latest version
@@ -235,6 +251,12 @@ class StoreClient:
             obj._store_tx_time = row[1]
             obj._store_valid_from = row[2]
             obj._store_event_type = "STATE_CHANGE"
+
+        # Fire hooks: on_exit → action → on_enter
+        sm.fire_on_exit(current_state, obj, current_state, new_state)
+        if t.action is not None:
+            t.action(obj, current_state, new_state)
+        sm.fire_on_enter(new_state, obj, current_state, new_state)
 
     # ── Read operations ───────────────────────────────────────────────
 
