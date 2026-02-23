@@ -1,8 +1,11 @@
 """
 Declarative state machines for Storable lifecycle management.
 
-Supports guards (Expr-based), actions (callables), on_enter/on_exit hooks,
-and per-transition user permissions.
+Three tiers of side-effects on each Transition:
+
+  Tier 1 — action:         Runs inside DB transaction, atomic with state change.
+  Tier 2 — on_enter/on_exit: Fire-and-forget after commit.
+  Tier 3 — start_workflow: Durable workflow via WorkflowEngine after commit.
 
     from store.state_machine import StateMachine, Transition
     from reactive.expr import Field, Const
@@ -12,18 +15,16 @@ and per-transition user permissions.
         transitions = [
             Transition("PENDING", "PARTIAL"),
             Transition("PENDING", "FILLED",
-                       guard=Field("quantity") > Const(0)),
+                       guard=Field("quantity") > Const(0),
+                       action=lambda obj, f, t: create_settlement(obj),
+                       on_enter=lambda obj, f, t: log.info("Filled!"),
+                       start_workflow=settlement_workflow),
             Transition("PENDING", "CANCELLED",
                        allowed_by=["risk_manager"]),
-            Transition("FILLED", "SETTLED",
-                       guard=Field("price") > Const(0),
-                       action=lambda obj, f, t: book_settlement(obj)),
         ]
-        on_enter = {
-            "FILLED": [lambda obj, f, t: log_fill(obj)],
-        }
 
     Order._state_machine = OrderLifecycle
+    Order._workflow_engine = engine  # enables start_workflow=
 """
 
 from dataclasses import dataclass, field
@@ -33,10 +34,17 @@ from typing import Optional, Callable, List
 @dataclass
 class Transition:
     """
-    A single state machine edge with optional guard, action, and permissions.
+    A single state machine edge with three tiers of side-effects.
 
     - guard: Expr that must evaluate to truthy against the object's data dict.
-    - action: callable(obj, from_state, to_state) fired after the transition.
+    - action: Tier 1 — callable(obj, from_state, to_state) runs inside the DB
+      transaction, atomic with the state change. If it raises, state rolls back.
+    - on_exit: Tier 2 — callable(obj, from_state, to_state) fires after commit,
+      best-effort. Exceptions are swallowed.
+    - on_enter: Tier 2 — callable(obj, from_state, to_state) fires after commit,
+      best-effort. Exceptions are swallowed.
+    - start_workflow: Tier 3 — callable reference dispatched via WorkflowEngine
+      after commit. Durable, survives crashes. Requires _workflow_engine on class.
     - allowed_by: list of usernames who can trigger this transition.
       If None, anyone with write access can trigger. Owner is always allowed.
     """
@@ -44,6 +52,9 @@ class Transition:
     to_state: str
     guard: object = None            # Optional[Expr] — avoid circular import
     action: Optional[Callable] = None
+    on_exit: Optional[Callable] = None
+    on_enter: Optional[Callable] = None
+    start_workflow: Optional[Callable] = None
     allowed_by: Optional[List[str]] = None
 
 
@@ -93,14 +104,13 @@ class StateMachine:
     Subclass and define:
         initial: str                    — the starting state
         transitions: list[Transition]   — list of Transition edges
-        on_enter: dict[str, list]       — {state: [callbacks]} fired on entry
-        on_exit: dict[str, list]        — {state: [callbacks]} fired on exit
+
+    Side-effects are declared per-Transition (action, on_enter, on_exit,
+    start_workflow), not on the StateMachine class.
     """
 
     initial: str = None
     transitions: list = []
-    on_enter: dict = {}
-    on_exit: dict = {}
 
     @classmethod
     def get_transition(cls, from_state, to_state):
@@ -142,14 +152,3 @@ class StateMachine:
         """Return list of valid next state names from from_state."""
         return [t.to_state for t in cls.transitions if t.from_state == from_state]
 
-    @classmethod
-    def fire_on_exit(cls, state, obj, from_state, to_state):
-        """Fire on_exit hooks for the given state."""
-        for callback in cls.on_exit.get(state, []):
-            callback(obj, from_state, to_state)
-
-    @classmethod
-    def fire_on_enter(cls, state, obj, from_state, to_state):
-        """Fire on_enter hooks for the given state."""
-        for callback in cls.on_enter.get(state, []):
-            callback(obj, from_state, to_state)

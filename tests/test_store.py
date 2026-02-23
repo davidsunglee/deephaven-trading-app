@@ -74,23 +74,22 @@ def _track_on_exit(obj, from_state, to_state):
 class OrderLifecycle(StateMachine):
     initial = "PENDING"
     transitions = [
-        Transition("PENDING", "PARTIAL"),
+        Transition("PENDING", "PARTIAL",
+                   on_exit=_track_on_exit),
         Transition("PENDING", "FILLED",
-                   guard=Field("quantity") > Const(0)),
+                   guard=Field("quantity") > Const(0),
+                   on_exit=_track_on_exit,
+                   on_enter=_track_on_enter),
         Transition("PENDING", "CANCELLED",
-                   allowed_by=["risk_manager"]),
-        Transition("PARTIAL", "FILLED"),
+                   allowed_by=["risk_manager"],
+                   on_exit=_track_on_exit),
+        Transition("PARTIAL", "FILLED",
+                   on_enter=_track_on_enter),
         Transition("PARTIAL", "CANCELLED"),
         Transition("FILLED", "SETTLED",
                    guard=Field("price") > Const(0),
                    action=_track_action),
     ]
-    on_enter = {
-        "FILLED": [_track_on_enter],
-    }
-    on_exit = {
-        "PENDING": [_track_on_exit],
-    }
 
 
 @dataclass
@@ -1585,3 +1584,179 @@ class TestSubscriptionListener:
 
         # Should have caught up on w2
         assert any(e.entity_id == w2._store_entity_id for e in events2)
+
+
+# ===========================================================================
+# Three-Tier Transition Side-Effects
+# ===========================================================================
+
+class TestThreeTierTransition:
+    """Test the three tiers of side-effects on state transitions."""
+
+    # ── Tier 1: Transactional action ─────────────────────────────────
+
+    def test_action_commits_with_state_change(self, alice):
+        """Action succeeds → both state change and action committed."""
+        tier1_log = []
+
+        class T1Lifecycle(StateMachine):
+            initial = "NEW"
+            transitions = [
+                Transition("NEW", "DONE",
+                           action=lambda obj, f, t: tier1_log.append("action_ran")),
+            ]
+
+        order = Order(symbol="AAPL", quantity=10, price=150.0, side="BUY")
+        order._state_machine = T1Lifecycle
+        alice.write(order)
+        alice.transition(order, "DONE")
+
+        assert order._store_state == "DONE"
+        assert "action_ran" in tier1_log
+
+    def test_action_failure_rolls_back_state_change(self, alice):
+        """Action raises → state change is rolled back."""
+        class FailLifecycle(StateMachine):
+            initial = "NEW"
+            transitions = [
+                Transition("NEW", "DONE",
+                           action=lambda obj, f, t: (_ for _ in ()).throw(
+                               ValueError("action failed"))),
+            ]
+
+        order = Order(symbol="MSFT", quantity=5, price=200.0, side="SELL")
+        order._state_machine = FailLifecycle
+        alice.write(order)
+
+        with pytest.raises(ValueError, match="action failed"):
+            alice.transition(order, "DONE")
+
+        # State should NOT have changed — rolled back
+        fresh = alice.read(Order, order._store_entity_id)
+        assert fresh._store_state == "NEW"
+
+    # ── Tier 2: Fire-and-forget hooks ────────────────────────────────
+
+    def test_on_enter_on_exit_fire_after_commit(self, alice):
+        """on_enter and on_exit fire after commit."""
+        hook_log = []
+
+        class T2Lifecycle(StateMachine):
+            initial = "A"
+            transitions = [
+                Transition("A", "B",
+                           on_exit=lambda obj, f, t: hook_log.append(("exit", f)),
+                           on_enter=lambda obj, f, t: hook_log.append(("enter", t))),
+            ]
+
+        order = Order(symbol="GOOG", quantity=1, price=100.0, side="BUY")
+        order._state_machine = T2Lifecycle
+        alice.write(order)
+        alice.transition(order, "B")
+
+        assert order._store_state == "B"
+        assert ("exit", "A") in hook_log
+        assert ("enter", "B") in hook_log
+
+    def test_on_enter_failure_does_not_rollback(self, alice):
+        """on_enter is fire-and-forget — failure doesn't affect state."""
+        class T2FailLifecycle(StateMachine):
+            initial = "X"
+            transitions = [
+                Transition("X", "Y",
+                           on_enter=lambda obj, f, t: (_ for _ in ()).throw(
+                               RuntimeError("hook boom"))),
+            ]
+
+        order = Order(symbol="TSLA", quantity=1, price=300.0, side="BUY")
+        order._state_machine = T2FailLifecycle
+        alice.write(order)
+
+        # Should NOT raise — on_enter failures are swallowed
+        alice.transition(order, "Y")
+        assert order._store_state == "Y"
+
+    # ── Tier 3: Workflow dispatch ────────────────────────────────────
+
+    def test_start_workflow_missing_engine_raises(self, alice):
+        """start_workflow without _workflow_engine raises RuntimeError."""
+        class T3Lifecycle(StateMachine):
+            initial = "START"
+            transitions = [
+                Transition("START", "END",
+                           start_workflow=lambda eid: None),
+            ]
+
+        order = Order(symbol="META", quantity=1, price=400.0, side="BUY")
+        order._state_machine = T3Lifecycle
+        # Do NOT set _workflow_engine
+        type(order)._workflow_engine = None
+        alice.write(order)
+
+        with pytest.raises(RuntimeError, match="_workflow_engine is not set"):
+            alice.transition(order, "END")
+
+    def test_start_workflow_dispatches(self, alice):
+        """start_workflow calls engine.workflow() with entity_id."""
+        dispatched = []
+
+        class FakeEngine:
+            def workflow(self, fn, entity_id):
+                dispatched.append((fn, entity_id))
+
+        def my_workflow(entity_id):
+            pass
+
+        class T3DispatchLifecycle(StateMachine):
+            initial = "OPEN"
+            transitions = [
+                Transition("OPEN", "CLOSED",
+                           start_workflow=my_workflow),
+            ]
+
+        order = Order(symbol="AMZN", quantity=1, price=180.0, side="BUY")
+        order._state_machine = T3DispatchLifecycle
+        type(order)._workflow_engine = FakeEngine()
+        alice.write(order)
+        alice.transition(order, "CLOSED")
+
+        assert len(dispatched) == 1
+        assert dispatched[0][0] is my_workflow
+        assert dispatched[0][1] == order._store_entity_id
+
+        # Clean up
+        type(order)._workflow_engine = None
+
+    def test_all_three_tiers_fire_in_order(self, alice):
+        """All three tiers fire in correct order on a single transition."""
+        log = []
+
+        class FakeEngine:
+            def workflow(self, fn, entity_id):
+                log.append("tier3_workflow")
+
+        class AllTiersLifecycle(StateMachine):
+            initial = "INIT"
+            transitions = [
+                Transition("INIT", "FINAL",
+                           action=lambda obj, f, t: log.append("tier1_action"),
+                           on_exit=lambda obj, f, t: log.append("tier2_on_exit"),
+                           on_enter=lambda obj, f, t: log.append("tier2_on_enter"),
+                           start_workflow=lambda eid: None),
+            ]
+
+        order = Order(symbol="NVDA", quantity=1, price=800.0, side="BUY")
+        order._state_machine = AllTiersLifecycle
+        type(order)._workflow_engine = FakeEngine()
+        alice.write(order)
+        alice.transition(order, "FINAL")
+
+        assert log == [
+            "tier1_action",     # Tier 1: inside transaction
+            "tier2_on_exit",    # Tier 2: after commit
+            "tier2_on_enter",   # Tier 2: after commit
+            "tier3_workflow",   # Tier 3: durable dispatch
+        ]
+
+        # Clean up
+        type(order)._workflow_engine = None

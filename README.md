@@ -461,7 +461,7 @@ REGISTRY.validate_instance(trade_obj)  # runtime constraint checks
 
 ## State Machines
 
-Declarative lifecycle management with **guards**, **actions**, **hooks**, and **per-transition permissions**:
+Declarative lifecycle management with **three tiers of side-effects** on each transition:
 
 ```python
 from store.state_machine import StateMachine, Transition
@@ -470,29 +470,29 @@ from reactive.expr import Field, Const
 class OrderLifecycle(StateMachine):
     initial = "PENDING"
     transitions = [
-        Transition("PENDING", "PARTIAL"),
         Transition("PENDING", "FILLED",
-                   guard=Field("quantity") > Const(0)),       # Expr guard
+                   guard=Field("quantity") > Const(0),
+                   action=lambda obj, f, t: create_settlement(obj),  # Tier 1: atomic
+                   on_exit=lambda obj, f, t: log("left PENDING"),    # Tier 2: fire-and-forget
+                   on_enter=lambda obj, f, t: notify_risk(obj),      # Tier 2: fire-and-forget
+                   start_workflow=settlement_workflow),               # Tier 3: durable
         Transition("PENDING", "CANCELLED",
-                   allowed_by=["risk_manager"]),               # Permission
-        Transition("PARTIAL", "FILLED"),
-        Transition("PARTIAL", "CANCELLED"),
+                   allowed_by=["risk_manager"]),
         Transition("FILLED", "SETTLED",
-                   guard=Field("price") > Const(0),
-                   action=lambda obj, f, t: book_settlement(obj)),
+                   guard=Field("price") > Const(0)),
     ]
-    on_enter = {"FILLED": [lambda obj, f, t: notify_risk(obj)]}
-    on_exit  = {"PENDING": [lambda obj, f, t: log_departure(obj)]}
-
-@dataclass
-class Order(Storable):
-    symbol: str = ""
-    quantity: int = 0
-    price: float = 0.0
-    side: str = ""
 
 Order._state_machine = OrderLifecycle
+Order._workflow_engine = engine  # enables start_workflow=
 ```
+
+### Three-Tier Side-Effects
+
+| Tier | Field | Runs | Guarantee |
+|------|-------|------|-----------|
+| **1** | `action=` | Inside DB transaction | **Atomic** — rolls back with state change |
+| **2** | `on_enter=` / `on_exit=` | After commit | Best-effort, fire-and-forget |
+| **3** | `start_workflow=` | After commit, via engine | **Durable** — survives crashes |
 
 ### Guards, Actions, Permissions
 
@@ -634,18 +634,20 @@ windsurf-project/
 │   └── bridge.py           # Auto-persist effect factory
 ├── workflow/
 │   ├── engine.py           # WorkflowEngine ABC + WorkflowHandle
-│   └── dbos_engine.py      # DBOS-backed implementation (hidden)
+│   ├── dbos_engine.py      # DBOS-backed implementation (hidden)
+│   └── dispatcher.py       # WorkflowDispatcher: durable transitions in workflows
 ├── bridge/
 │   ├── store_bridge.py     # StoreBridge: PG NOTIFY → DH ticking tables
 │   └── type_mapping.py     # @dataclass → DH schema + row extraction
 ├── tests/
-│   ├── test_store.py       # Bi-temporal + state machine + RLS + subs tests (127)
+│   ├── test_store.py       # Bi-temporal + state machine + RLS + 3-tier tests (134)
 │   ├── test_reactive.py    # Expression + graph + cross-entity tests (137)
 │   ├── test_reactive_finance.py  # Finance domain tests (49)
 │   ├── test_workflow.py    # Workflow engine tests (16)
 │   ├── test_bridge.py      # DH ↔ Store bridge tests, real DH + PG (17)
 │   └── test_registry.py    # Column registry enforcement tests (56)
 ├── demo_bridge.py          # Interactive demo: store + graph → DH ticking tables
+├── demo_three_tiers.py     # Demo: three-tier state machine side-effects
 ├── requirements-server.txt
 ├── requirements-client.txt
 ├── requirements-store.txt  # reaktiv, psycopg2-binary, pgserver, dbos

@@ -236,9 +236,11 @@ class StoreClient:
     def transition(self, obj, new_state, valid_from=None):
         """
         Transition an entity to a new lifecycle state.
-        Validates against the registered state machine (guards, permissions).
-        Fires on_exit → action → on_enter hooks.
-        Creates a STATE_CHANGE event.
+
+        Three tiers of side-effects:
+          Tier 1 (action):         Runs inside the DB transaction — atomic.
+          Tier 2 (on_exit/on_enter): Fire-and-forget after commit.
+          Tier 3 (start_workflow): Durable workflow dispatch after commit.
         """
         if obj._state_machine is None:
             raise ValueError(
@@ -272,45 +274,76 @@ class StoreClient:
             meta["allowed_by"] = t.allowed_by
         event_meta = json.dumps(meta)
 
-        with self.conn.cursor() as cur:
-            # Copy owner, readers/writers from latest version
-            cur.execute(
-                """
-                SELECT owner, readers, writers FROM object_events
-                WHERE entity_id = %s ORDER BY version DESC LIMIT 1
-                """,
-                (obj._store_entity_id,),
-            )
-            prev = cur.fetchone()
-            original_owner = prev[0] if prev else self.user
-            readers = prev[1] if prev else []
-            writers = prev[2] if prev else []
+        # === TIER 1: state change + action inside transaction ===
+        old_autocommit = self.conn.autocommit
+        self.conn.autocommit = False
+        try:
+            with self.conn.cursor() as cur:
+                # Copy owner, readers/writers from latest version
+                cur.execute(
+                    """
+                    SELECT owner, readers, writers FROM object_events
+                    WHERE entity_id = %s ORDER BY version DESC LIMIT 1
+                    """,
+                    (obj._store_entity_id,),
+                )
+                prev = cur.fetchone()
+                original_owner = prev[0] if prev else self.user
+                readers = prev[1] if prev else []
+                writers = prev[2] if prev else []
 
-            cur.execute(
-                """
-                INSERT INTO object_events
-                    (entity_id, version, type_name, owner, data, state, event_type,
-                     event_meta, readers, writers, valid_from)
-                VALUES (%s, %s, %s, %s, %s::jsonb, %s, 'STATE_CHANGE',
-                        %s::jsonb, %s, %s, COALESCE(%s, now()))
-                RETURNING event_id, tx_time, valid_from
-                """,
-                (obj._store_entity_id, next_ver, type_name, original_owner,
-                 json_data, new_state, event_meta, readers, writers, valid_from),
-            )
-            row = cur.fetchone()
-            obj._store_version = next_ver
-            obj._store_state = new_state
-            obj._store_tx_time = row[1]
-            obj._store_valid_from = row[2]
-            obj._store_event_type = "STATE_CHANGE"
+                cur.execute(
+                    """
+                    INSERT INTO object_events
+                        (entity_id, version, type_name, owner, data, state, event_type,
+                         event_meta, readers, writers, valid_from)
+                    VALUES (%s, %s, %s, %s, %s::jsonb, %s, 'STATE_CHANGE',
+                            %s::jsonb, %s, %s, COALESCE(%s, now()))
+                    RETURNING event_id, tx_time, valid_from
+                    """,
+                    (obj._store_entity_id, next_ver, type_name, original_owner,
+                     json_data, new_state, event_meta, readers, writers, valid_from),
+                )
+                row = cur.fetchone()
+                obj._store_version = next_ver
+                obj._store_state = new_state
+                obj._store_tx_time = row[1]
+                obj._store_valid_from = row[2]
+                obj._store_event_type = "STATE_CHANGE"
 
-        # Fire hooks: on_exit → action → on_enter
-        sm.fire_on_exit(current_state, obj, current_state, new_state)
-        if t.action is not None:
-            t.action(obj, current_state, new_state)
-        sm.fire_on_enter(new_state, obj, current_state, new_state)
+            # Tier 1: action runs inside transaction — atomic with state change
+            if t.action is not None:
+                t.action(obj, current_state, new_state)
+
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            self.conn.autocommit = old_autocommit
+
+        # === TIER 2: fire-and-forget hooks (after commit) ===
+        if t.on_exit is not None:
+            try:
+                t.on_exit(obj, current_state, new_state)
+            except Exception:
+                pass
+        if t.on_enter is not None:
+            try:
+                t.on_enter(obj, current_state, new_state)
+            except Exception:
+                pass
         self._emit_event(obj)
+
+        # === TIER 3: durable workflow (after commit) ===
+        if t.start_workflow is not None:
+            wf_engine = getattr(type(obj), '_workflow_engine', None)
+            if wf_engine is None:
+                raise RuntimeError(
+                    f"{type(obj).__name__}._workflow_engine is not set but "
+                    f"transition {current_state}→{new_state} has start_workflow="
+                )
+            wf_engine.workflow(t.start_workflow, obj._store_entity_id)
 
     def write_many(self, objects, valid_from=None):
         """

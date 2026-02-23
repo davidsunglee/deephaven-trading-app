@@ -87,6 +87,9 @@ class Storable:
     # Optional state machine — set on the class by the user
     _state_machine = None
 
+    # Optional workflow engine — enables start_workflow= on Transitions
+    _workflow_engine = None
+
     # Column registry — mandatory enforcement for all subclasses
     _registry = None
 
