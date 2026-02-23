@@ -146,6 +146,71 @@ listener.stop()
 
 **Durable catch-up**: if the listener is down when events happen, it replays missed events from the append-only log on reconnect. With `subscriber_id`, the checkpoint persists to DB — survives crashes.
 
+## Deephaven ↔ Store Bridge
+
+Streams object store events into Deephaven ticking tables in real time. The bridge is a **library, not a service** — embed it in the store server (always-on) or a user process (personal filters).
+
+```python
+from bridge import StoreBridge
+from reactive.expr import Field, Const
+
+bridge = StoreBridge(host=host, port=port, dbname=dbname,
+                     user="bridge_user", password="bridge_pw")
+
+# Register types — only these are bridged
+bridge.register(Order)                                           # all orders
+bridge.register(Trade, filter=Field("symbol") == Const("AAPL"))  # only AAPL
+bridge.register(Signal)
+
+bridge.start()  # SubscriptionListener → PG NOTIFY → DynamicTableWriter
+
+# Ticking Deephaven tables (auto-created from @dataclass fields)
+orders_raw  = bridge.table(Order)              # append-only event stream
+orders_live = orders_raw.last_by("EntityId")   # latest state per entity
+
+# Custom writer (pattern 3: shared with ReactiveGraph effects)
+my_writer = DynamicTableWriter(infer_dh_schema(Order))
+bridge.register(Order, writer=my_writer)
+```
+
+### Deployment Modes
+
+| Mode | Where bridge runs | Best for |
+|------|-------------------|----------|
+| **Server-side** | Store server process | Always-on, all types bridged centrally |
+| **User-side** | User's Python process | Personal filters, direct graph→DH push |
+
+### Computed Values → Deephaven
+
+| Pattern | Flow | Use when |
+|---------|------|----------|
+| **Persist → bridge** | ReactiveGraph → `auto_persist_effect` → store → bridge → DH | Calc must be durable/audited |
+| **Calc in DH** | Bridge ships raw data → DH `.update(["RiskScore = ..."])` | Real-time dashboards |
+| **Direct push** | Graph effect → DH writer (same process, no PG hop) | Ultra-low-latency |
+
+### Interactive Demo
+
+Run the full end-to-end demo — starts embedded PG + Deephaven, bridges store events, and pushes in-memory reactive calcs directly to DH:
+
+```bash
+python3 demo_bridge.py
+# Open http://localhost:10000 in your browser
+```
+
+The demo publishes **8 ticking tables** to the Deephaven web IDE:
+
+| Table | Source | Persisted? |
+|-------|--------|------------|
+| `orders_raw` | Store events via bridge (append-only) | ✅ |
+| `orders_live` | `orders_raw.last_by("EntityId")` | ✅ |
+| `trades_raw` / `trades_live` | Store events via bridge | ✅ |
+| `portfolio` | DH aggregation on trades (P&L, qty, count) | ✅ |
+| `risk_calcs` | ReactiveGraph → effect → DH writer (Pattern 3) | ❌ |
+| `risk_live` | `risk_calcs.last_by("symbol")` | ❌ |
+| `risk_totals` | DH aggregation (total MV + risk) | ❌ |
+
+The `risk_*` tables demonstrate **Pattern 3**: the ReactiveGraph computes `market_value` and `risk_score` in memory, and an effect pushes directly to a `DynamicTableWriter` — no store, no PG, no persistence.
+
 ## Workflow Orchestration
 
 Durable multi-step workflows with a **backend-swappable engine** — currently backed by DBOS Transact (PostgreSQL-only, zero extra infrastructure). Users never import DBOS directly.
@@ -475,11 +540,16 @@ windsurf-project/
 ├── workflow/
 │   ├── engine.py           # WorkflowEngine ABC + WorkflowHandle
 │   └── dbos_engine.py      # DBOS-backed implementation (hidden)
+├── bridge/
+│   ├── store_bridge.py     # StoreBridge: PG NOTIFY → DH ticking tables
+│   └── type_mapping.py     # @dataclass → DH schema + row extraction
 ├── tests/
 │   ├── test_store.py       # Bi-temporal + state machine + RLS + subs tests (127)
 │   ├── test_reactive.py    # Expression + graph + cross-entity tests (137)
 │   ├── test_reactive_finance.py  # Finance domain tests (49)
-│   └── test_workflow.py    # Workflow engine tests (16)
+│   ├── test_workflow.py    # Workflow engine tests (16)
+│   └── test_bridge.py      # DH ↔ Store bridge tests, real DH + PG (17)
+├── demo_bridge.py          # Interactive demo: store + graph → DH ticking tables
 ├── requirements-server.txt
 ├── requirements-client.txt
 ├── requirements-store.txt  # reaktiv, psycopg2-binary, pgserver, dbos
